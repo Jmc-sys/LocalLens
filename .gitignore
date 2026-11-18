@@ -1,0 +1,52 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.token
+
+# User photos and persistent storage
+/storage/
+/mysql_data/
+/backups/
+/data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Node.js
+node_modules/
+dist/
+.vite/
+coverage/
+
+# Logs
+*.log
+
+# Database backups
+*.sql
+!/database/init/**/*.sql
+!/database/migrations/**/*.sql
+*.sqlite
+*.sqlite3
+
+# Temporary files
+*.bak
+*.tmp
+*.zip
+*.tar
+*.tar.gz
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

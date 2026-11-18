@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+mysql-connector-python
+python-multipart
+pwdlib[argon2]
+PyJWT
+Pillow
+email-validator
+pillow-heif
