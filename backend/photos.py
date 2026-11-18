@@ -3,6 +3,7 @@ import uuid
 import hashlib
 import shutil
 import warnings
+import logging
 
 from pathlib import Path
 from datetime import datetime
@@ -19,6 +20,8 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+
+logger = logging.getLogger("uvicorn.error")
 
 MEDIA_ROOT = Path(
     os.getenv("MEDIA_ROOT", "/storage")
@@ -39,6 +42,8 @@ Image.MAX_IMAGE_PIXELS = 80_000_000
 
 IMAGE_FORMATS = {
     "JPEG": (".jpg", "image/jpeg"),
+    # MPO is a JPEG-based container; retain all original bytes.
+    "MPO": (".mpo", "image/mpo"),
     "PNG": (".png", "image/png"),
     "WEBP": (".webp", "image/webp"),
     "GIF": (".gif", "image/gif"),
@@ -204,77 +209,81 @@ def build_photo_router(get_connection, get_current_user):
 
             sha256 = digest.hexdigest()
 
+            if not size:
+                raise HTTPException(415, "Uploaded image is empty")
+
+            image_format = None
+            stage = "identify"
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter(
-                        "error",
-                        Image.DecompressionBombWarning
+                        "error", Image.DecompressionBombWarning
                     )
-
                     with Image.open(temp_path) as image:
                         image_format = image.format
-                        image.verify()
+                        if image_format not in IMAGE_FORMATS:
+                            logger.warning(
+                                "Upload rejected: format=%s bytes=%d mime=%r",
+                                image_format, size, file.content_type
+                            )
+                            raise HTTPException(415, "Unsupported detected image format: " + str(image_format))
 
-                    if image_format not in IMAGE_FORMATS:
-                        raise HTTPException(
-                            415, "Unsupported image format"
-                        )
-
-                    extension, mime_type = (
-                        IMAGE_FORMATS[image_format]
-                    )
-
-                    with Image.open(temp_path) as image:
+                        extension, mime_type = IMAGE_FORMATS[image_format]
+                        stage = "decode"
+                        # Decode the primary image, rather than relying on verify().
+                        # Keep Pillow's truncated-image protection enabled.
+                        image.load()
+                        stage = "metadata"
                         captured_at = None
-                        exif = image.getexif()
                         try:
-                            exif_details = exif.get_ifd(34665)
-                        except (KeyError, ValueError, TypeError):
-                            exif_details = {}
-
-                        date = (
-                            exif_details.get(36867)
-                            or exif_details.get(36868)
-                            or exif.get(36867)
-                            or exif.get(306)
-                        )
-
-                        if date:
+                            exif = image.getexif()
                             try:
+                                details = exif.get_ifd(34665)
+                            except Exception as exc:
+                                logger.warning("Nested EXIF ignored: %s", type(exc).__name__)
+                                details = {}
+                            date = (details.get(36867) or details.get(36868)
+                                    or exif.get(36867) or exif.get(306))
+                            if date:
+                                if isinstance(date, bytes):
+                                    date = date.decode("ascii", errors="ignore")
                                 captured_at = datetime.strptime(
-                                    str(date),
-                                    "%Y:%m:%d %H:%M:%S"
+                                    str(date).strip("\x00 "), "%Y:%m:%d %H:%M:%S"
                                 )
-                            except ValueError:
-                                pass
+                                if captured_at.year < 1000:
+                                    captured_at = None
+                        except Exception as exc:
+                            logger.warning("Optional capture metadata ignored: %s", type(exc).__name__)
 
-                        image = ImageOps.exif_transpose(image)
-                        width, height = image.size
+                        try:
+                            oriented = ImageOps.exif_transpose(image)
+                        except Exception as exc:
+                            logger.warning("Optional orientation metadata ignored: %s", type(exc).__name__)
+                            oriented = image.copy()
 
-                        image.thumbnail(
-                            (480, 480),
-                            Image.Resampling.LANCZOS
-                        )
+                        stage = "thumbnail"
+                        width, height = oriented.size
+                        oriented.thumbnail((480, 480), Image.Resampling.LANCZOS)
+                        rgb = oriented.convert("RGB")
+                        # Do not propagate malformed EXIF or other metadata to derivatives.
+                        rgb.info.clear()
+                        thumbnail_path = thumbnails / f"{unique_id}.jpg"
+                        stage = "write_thumbnail"
+                        rgb.save(thumbnail_path, "JPEG", quality=85)
 
-                        thumbnail_path = (
-                            thumbnails / f"{unique_id}.jpg"
-                        )
-
-                        image.convert("RGB").save(
-                            thumbnail_path,
-                            "JPEG",
-                            quality=85
-                        )
-
-            except (
-                UnidentifiedImageError,
-                OSError,
-                Image.DecompressionBombError,
-                Image.DecompressionBombWarning,
-            ):
-                raise HTTPException(
-                    415, "Invalid or unsupported image"
+            except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+                logger.warning("Image pixel limit exceeded: format=%s bytes=%d", image_format, size)
+                raise HTTPException(413, "Image exceeds safe pixel limit") from exc
+            except (UnidentifiedImageError, OSError, ValueError, SyntaxError, EOFError, RuntimeError) as exc:
+                logger.warning(
+                    "Image upload failed: stage=%s format=%s bytes=%d mime=%r error=%s: %s",
+                    stage, image_format, size, file.content_type, type(exc).__name__, str(exc)[:300]
                 )
+                if stage == "write_thumbnail":
+                    raise HTTPException(500, "Unable to write photo thumbnail") from exc
+                if stage == "thumbnail":
+                    raise HTTPException(422, "Unable to generate photo thumbnail") from exc
+                raise HTTPException(415, "Unable to decode image; file may be damaged or unsupported") from exc
 
             with database(get_connection) as (conn, cursor):
 
@@ -429,7 +438,7 @@ def build_photo_router(get_connection, get_current_user):
             }
         )
 
-    
+
     @router.get("/{photo_id}/preview")
     def photo_preview(
         photo_id: int,
@@ -509,16 +518,21 @@ def build_photo_router(get_connection, get_current_user):
 
                     with Image.open(original_path) as image:
 
-                        image = ImageOps.exif_transpose(
-                            image
-                        )
+                        image.load()
+                        try:
+                            image = ImageOps.exif_transpose(image)
+                        except Exception as exc:
+                            logger.warning("Preview orientation metadata ignored: %s", type(exc).__name__)
+                            image = image.copy()
 
                         image.thumbnail(
                             PREVIEW_MAX_SIZE,
                             Image.Resampling.LANCZOS
                         )
 
-                        image.convert("RGB").save(
+                        rgb = image.convert("RGB")
+                        rgb.info.clear()
+                        rgb.save(
                             temp_path,
                             format="JPEG",
                             quality=PREVIEW_QUALITY,
@@ -616,93 +630,5 @@ def build_photo_router(get_connection, get_current_user):
 
             conn.commit()
             return {"status": "restored"}
-    
-    @router.get("/{photo_id}/preview")
-    def preview_photo(
-        photo_id: int,
-        user=Depends(get_current_user)
-    ):
-        with database(get_connection) as (conn, cursor):
-            photo = owned_photo(
-                cursor, photo_id, user["id"]
-            )
-
-        path = Path(photo["storage_path"]).resolve()
-
-        user_root = (
-            MEDIA_ROOT / "users" / str(user["id"])
-        ).resolve()
-
-        if (
-            not path.is_relative_to(user_root)
-            or not path.is_file()
-        ):
-            raise HTTPException(
-                404, "Original file unavailable"
-            )
-
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter(
-                    "error",
-                    Image.DecompressionBombWarning
-                )
-
-                with Image.open(path) as image:
-                    image = ImageOps.exif_transpose(image)
-
-                    image.thumbnail(
-                        (2560, 2560),
-                        Image.Resampling.LANCZOS
-                    )
-
-                    if (
-                        image.mode in ("RGBA", "LA")
-                        or "transparency" in image.info
-                    ):
-                        image = image.convert("RGBA")
-
-                        background = Image.new(
-                            "RGBA",
-                            image.size,
-                            (255, 255, 255, 255)
-                        )
-
-                        background.alpha_composite(image)
-                        image = background.convert("RGB")
-                    else:
-                        image = image.convert("RGB")
-
-                    buffer = BytesIO()
-
-                    image.save(
-                        buffer,
-                        format="JPEG",
-                        quality=92,
-                        optimize=True
-                    )
-
-                    buffer.seek(0)
-
-            return StreamingResponse(
-                buffer,
-                media_type="image/jpeg",
-                headers={
-                    "Cache-Control": "private, no-store",
-                    "X-Content-Type-Options": "nosniff"
-                }
-            )
-
-        except (
-            UnidentifiedImageError,
-            OSError,
-            ValueError,
-            Image.DecompressionBombError,
-            Image.DecompressionBombWarning
-        ):
-            raise HTTPException(
-                415,
-                "Unable to generate image preview"
-            )
 
     return router

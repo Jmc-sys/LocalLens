@@ -583,6 +583,7 @@ export default function PhotoLibrary({ page }) {
                 "image/heif",
                 "image/tiff",
                 "image/bmp",
+                "image/mpo",
               ].includes(viewer.mime_type)
                 ? "preview"
                 : "file"
