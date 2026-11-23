@@ -1,9 +1,16 @@
+import SharedAlbums from "./SharedAlbums";
 import { useCallback, useEffect, useState } from "react";
 import { api, mediaBlob } from "./api";
 import PrivateImage from "./PrivateImage";
-import UploadManager from "./UploadManager";
+import UniversalUpload from "./UniversalUpload";
+import PrivateVideo from "./PrivateVideo";
 
-export default function PhotoLibrary({ page }) {
+const isStandaloneVideo = (item) => item?.media_type === "video" ||
+  item?.mime_type?.startsWith("video/");
+import TrashControls from "./TrashControls";
+import { LiveViewer } from "./LivePhotos";
+
+function OwnerPhotoLibrary({ page }) {
   const [result, setResult] = useState(null);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [albums, setAlbums] = useState([]);
@@ -26,10 +33,11 @@ export default function PhotoLibrary({ page }) {
   // Tag every response with the exact view that requested it.
   const albumId = activeAlbum?.id ?? null;
   const params = new URLSearchParams({
-    sort: page === "Recently Added" ? "newest" : sort,
+    sort: sort,
     search,
     favorite: String(page === "Favorites"),
     trash: String(isTrash),
+    media: page === "Videos" ? "video" : page === "Photos" ? "photo" : "all",
     limit: String(PAGE_SIZE),
     offset: String(pageIndex * PAGE_SIZE),
   });
@@ -80,7 +88,15 @@ export default function PhotoLibrary({ page }) {
         ]);
         if (signal.aborted) return;
         setAlbums(albumData);
-        setResult({ key: requestKey, photos: photoData, error: "" });
+        const liveIds = new Set();
+        const missingMotionIds = new Set();
+        for (let i=0; i<photoData.length; i+=500) {
+          const data = await api("/live/status", { method:"POST", body:JSON.stringify({photo_ids:photoData.slice(i,i+500).map(p=>p.id)}), signal });
+          data.ids.forEach(id=>liveIds.add(id));
+          (data.missing_ids || []).forEach(id=>missingMotionIds.add(id));
+        }
+        if (signal.aborted) return;
+        setResult({ key: requestKey, photos: photoData.map(p=>({...p,is_live:liveIds.has(p.id),motion_missing:missingMotionIds.has(p.id)})), error: "" });
       } catch (err) {
         if (signal.aborted) return;
         setResult({ key: requestKey, photos: [], error: err.message });
@@ -172,7 +188,7 @@ export default function PhotoLibrary({ page }) {
   function moveSelected() {
     if (
       !window.confirm(
-        `${isTrash ? "Restore" : "Move to trash"} ${selected.length} photo(s)?`
+        `${isTrash ? "Restore" : "Move to trash"} ${selected.length} item(s)?`
       )
     ) return;
 
@@ -194,6 +210,16 @@ export default function PhotoLibrary({ page }) {
 
   async function download(photo) {
     try {
+      if (isStandaloneVideo(photo)) {
+        const { url } = await api(`/videos/${photo.id}/playback-url`, { method: "POST" });
+        const link = document.createElement("a");
+        link.href = `${url}&download=1`;
+        link.download = photo.original_filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        return;
+      }
       const blob = await mediaBlob(photo.id, "file");
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
@@ -253,8 +279,10 @@ export default function PhotoLibrary({ page }) {
         )}
       </div>
 
-      {page === "Photos" && (
-        <UploadManager onComplete={load} />
+      {isTrash && <TrashControls selected={selected} onDeleted={() => { setSelected([]); setPageIndex(0); load(); }} />}
+
+      {(page === "Photos" || page === "Videos") && (
+        <><UniversalUpload onComplete={load} /></>
       )}
 
       {(error || loadError) && (
@@ -303,7 +331,7 @@ export default function PhotoLibrary({ page }) {
               </button>
 
               <h3>{album.name}</h3>
-              <p>{album.photo_count} photos</p>
+              <p>{album.photo_count} items</p>
 
               <button
                 className="secondary-button"
@@ -364,6 +392,7 @@ export default function PhotoLibrary({ page }) {
             />
 
             <select
+              className="locallens-sort-compact"
               value={sort}
               onChange={(e) => {
                 setSort(e.target.value);
@@ -457,13 +486,13 @@ export default function PhotoLibrary({ page }) {
 
           {!loadingPhotos && !loadError && (
             <p className="media-count">
-              {visiblePhotos.length} photos displayed
+              {visiblePhotos.length} items displayed
             </p>
           )}
 
           {!loadingPhotos && !loadError && !visiblePhotos.length && (
             <div className="empty-library">
-              No photos found.
+              No media found.
             </div>
           )}
 
@@ -521,7 +550,8 @@ export default function PhotoLibrary({ page }) {
                 )}
 
                 <div className="photo-name">
-                  {photo.original_filename}
+                  {isStandaloneVideo(photo) && <span className="media-video-tag">▶ VIDEO</span>}
+                  {photo.is_live && <span className="live-tag">LIVE </span>}{photo.motion_missing && <span className="motion-incomplete-tag" title="Original image preserved; companion motion video was not received">MOTION MISSING </span>}{photo.original_filename}
                 </div>
               </article>
             ))}
@@ -575,7 +605,8 @@ export default function PhotoLibrary({ page }) {
             </button>
           </header>
 
-          <PrivateImage
+          {viewer.is_live ? <LiveViewer key={viewer.id} photo={viewer}>
+          {isStandaloneVideo(viewer) ? <PrivateVideo photo={viewer} /> : (<PrivateImage
             id={viewer.id}
             type={
               [
@@ -589,9 +620,33 @@ export default function PhotoLibrary({ page }) {
                 : "file"
             }
             alt={viewer.original_filename}
-          />
+          />)}
+          </LiveViewer> : (
+          isStandaloneVideo(viewer) ? <PrivateVideo photo={viewer} /> : (<PrivateImage
+            id={viewer.id}
+            type={
+              [
+                "image/heic",
+                "image/heif",
+                "image/tiff",
+                "image/bmp",
+                "image/mpo",
+              ].includes(viewer.mime_type)
+                ? "preview"
+                : "file"
+            }
+            alt={viewer.original_filename}
+          />)
+          )}
         </div>
       )}
     </section>
   );
+}
+
+// Shared Album browsing is isolated from existing owner-only gallery hooks.
+export default function PhotoLibrary(props) {
+  return props.page === "Shared Albums"
+    ? <SharedAlbums />
+    : <OwnerPhotoLibrary {...props} />;
 }

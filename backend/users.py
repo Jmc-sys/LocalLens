@@ -248,12 +248,12 @@ def build_user_router(
                 """
                 SELECT
                     COUNT(*) AS total_photos,
-                    COALESCE(SUM(size_bytes), 0)
+                    COALESCE(SUM(size_bytes + resource_bytes), 0)
                         AS used_bytes,
                     COALESCE(SUM(
                         CASE
                             WHEN deleted_at IS NOT NULL
-                            THEN size_bytes
+                            THEN size_bytes + resource_bytes
                             ELSE 0
                         END
                     ), 0) AS trash_bytes,

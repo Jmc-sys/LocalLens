@@ -1,0 +1,11 @@
+.bulk-uploader { display:grid; gap:16px; margin-bottom:20px; }
+.bulk-drop { border:2px dashed #334155; border-radius:14px; padding:24px; text-align:center; background:#121c2e; }
+.bulk-drop.dragging { border-color:#a7f3d0; }
+.bulk-drop p,.bulk-status small { color:#94a3b8; font-size:13px; }
+.bulk-controls { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:center; }
+.bulk-status .bulk-controls { justify-content:flex-start; }
+.bulk-status progress { width:100%; height:16px; accent-color:#34d399; margin-top:16px; }
+.bulk-list { max-height:300px; overflow:auto; margin:14px 0; }
+.bulk-row { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:12px; padding:9px 0; border-bottom:1px solid #334155; }
+.bulk-row span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.bulk-row small { overflow-wrap:anywhere; }

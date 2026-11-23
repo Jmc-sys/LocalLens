@@ -59,7 +59,7 @@ def build_admin_router(
                        u.created_at,
                        u.last_login_at,
                        COUNT(p.id) AS photo_count,
-                       COALESCE(SUM(p.size_bytes), 0)
+                       COALESCE(SUM(p.size_bytes + p.resource_bytes), 0)
                            AS used_bytes
                 FROM users u
                 LEFT JOIN photos p ON p.user_id = u.id
@@ -250,7 +250,7 @@ def build_admin_router(
             cursor.execute(
                 """
                 SELECT COUNT(*) AS total_photos,
-                    COALESCE(SUM(size_bytes), 0)
+                    COALESCE(SUM(size_bytes + resource_bytes), 0)
                         AS media_bytes
                 FROM photos
                 """

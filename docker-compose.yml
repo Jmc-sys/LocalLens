@@ -1,5 +1,14 @@
 
 services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - frontend
   db:
     image: mysql:8.4
     restart: unless-stopped

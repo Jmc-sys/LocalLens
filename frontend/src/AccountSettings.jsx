@@ -1,6 +1,7 @@
 import SessionSettings from "./SessionSettings";
 import { useEffect, useState } from "react";
 import { api, logout } from "./api";
+import TrashRetentionSettings from "./TrashRetentionSettings";
 
 export function formatBytes(bytes) {
   if (bytes === null || bytes === undefined) {
@@ -263,6 +264,7 @@ export default function AccountSettings({
  
       <SessionSettings />
 
+      <TrashRetentionSettings />
     </section>
   );
 }

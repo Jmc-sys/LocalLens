@@ -4,6 +4,11 @@ import mysql.connector
 from fastapi import FastAPI, HTTPException, Depends
 from auth import build_auth_router
 from photos import build_photo_router
+from shared_albums import build_shared_album_router
+from videos import build_video_router
+from universal_media import build_universal_media_router
+from trash_management import build_trash_router
+from live_photos import build_live_router
 from albums import build_album_router
 from users import build_user_router
 from admin import build_admin_router
@@ -11,7 +16,7 @@ from admin import build_admin_router
 app = FastAPI(
     title="LocalLens API",
     description="Local photo storage and management API",
-    version="0.4.1",
+    version="0.4.2",
 )
 
 def get_connection():
@@ -41,6 +46,11 @@ app.include_router(
     )
 )
 app.include_router(auth_router)
+app.include_router(build_shared_album_router(get_connection, get_current_user))
+app.include_router(build_video_router(get_connection, get_current_user))
+app.include_router(build_universal_media_router(get_connection, get_current_user))
+app.include_router(build_trash_router(get_connection, get_current_user))
+app.include_router(build_live_router(get_connection, get_current_user))
 app.include_router(
     build_photo_router(get_connection, get_current_user)
 )

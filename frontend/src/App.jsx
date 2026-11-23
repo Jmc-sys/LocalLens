@@ -74,10 +74,10 @@ export default function App() {
   }
 
   const navigation = [
-    "Photos",
-    "Albums",
+    "Photos", "Videos",
+    "Albums", "Shared Albums",
     "Favorites",
-    "Recently Added",
+
     "Trash",
     "Settings",
   ];

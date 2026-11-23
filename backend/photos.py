@@ -15,10 +15,11 @@ from pillow_heif import register_heif_opener
 register_heif_opener()
 from fastapi import (
     APIRouter, Depends, HTTPException,
-    UploadFile, File, Query
+    UploadFile, File, Form, Query
 )
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from media_names import name_for_duplicate, find_filename_collision, filename_collision_response
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -105,6 +106,7 @@ def build_photo_router(get_connection, get_current_user):
         search: str = Query("", max_length=255),
         favorite: bool = False,
         trash: bool = False,
+        media: str = Query("all", pattern="^(all|photo|video)$"),
         limit: int = Query(200, ge=1, le=500),
         offset: int = Query(0, ge=0),
         user=Depends(get_current_user)
@@ -133,6 +135,11 @@ def build_photo_router(get_connection, get_current_user):
         if favorite:
             conditions.append("is_favorite = TRUE")
 
+        if media == "video":
+            conditions.append("media_type = 'video'")
+        elif media == "photo":
+            conditions.append("media_type <> 'video'")
+
         if search:
             conditions.append(
                 "(original_filename LIKE %s "
@@ -145,7 +152,7 @@ def build_photo_router(get_connection, get_current_user):
         with database(get_connection) as (conn, cursor):
             cursor.execute(
                 f"""
-                SELECT id, original_filename, mime_type,
+                SELECT id, original_filename, mime_type, media_type, duration_ms,
                        size_bytes, width, height,
                        captured_at, uploaded_at,
                        is_favorite, description, deleted_at
@@ -162,6 +169,8 @@ def build_photo_router(get_connection, get_current_user):
     @router.post("/upload")
     def upload_photo(
         file: UploadFile = File(...),
+        on_duplicate: str = Form('skip'),
+        new_name: str | None = Form(None),
         user=Depends(get_current_user)
     ):
         user_id = user["id"]
@@ -183,6 +192,11 @@ def build_photo_router(get_connection, get_current_user):
             (file.filename or "photo")
             .replace("\\", "/").split("/")[-1][:255]
         ) or "photo"
+
+        if on_duplicate not in ('skip', 'keep'):
+            raise HTTPException(422, 'Invalid duplicate decision')
+        if on_duplicate == 'keep':
+            filename = name_for_duplicate(new_name, filename)
 
         digest = hashlib.sha256()
         size = 0
@@ -208,9 +222,31 @@ def build_photo_router(get_connection, get_current_user):
                     output.write(chunk)
 
             sha256 = digest.hexdigest()
+            # Detect duplicates before decoding HEIC, extracting EXIF, or
+            # generating thumbnails. Skip is cheap and safe for large folders.
+            with database(get_connection) as (conn, cursor):
+                cursor.execute("""SELECT id,deleted_at,original_filename,mime_type,media_type
+                    FROM photos WHERE user_id=%s AND sha256=%s LIMIT 1""",
+                    (user_id,sha256))
+                previous = cursor.fetchone()
+            if previous:
+                return {
+                    'status':'duplicate','id':previous['id'],
+                    'in_trash':bool(previous['deleted_at']),
+                    'existing': {key: previous[key]
+                        for key in ('id','original_filename','mime_type','media_type')},
+                }
 
             if not size:
                 raise HTTPException(415, "Uploaded image is empty")
+
+            # Same filename but different bytes: request a rename decision
+            # BEFORE expensive image decoding or thumbnail generation.
+            if on_duplicate == 'skip':
+                with database(get_connection) as (conn, cursor):
+                    conflict = find_filename_collision(cursor, user_id, filename, sha256)
+                if conflict:
+                    return filename_collision_response(conflict)
 
             image_format = None
             stage = "identify"
@@ -300,7 +336,7 @@ def build_photo_router(get_connection, get_current_user):
 
                 cursor.execute(
                     """
-                    SELECT id, deleted_at FROM photos
+                    SELECT id, deleted_at, original_filename, mime_type, media_type FROM photos
                     WHERE user_id = %s AND sha256 = %s
                     LIMIT 1
                     """,
@@ -314,15 +350,29 @@ def build_photo_router(get_connection, get_current_user):
                         "status": "duplicate",
                         "id": existing["id"],
                         "in_trash": bool(existing["deleted_at"]),
-                        "filename": filename
+                        "filename": filename,
+                        "existing": {key: existing[key] for key in
+                            ("id", "original_filename", "mime_type", "media_type")}
                     }
+
+                if on_duplicate == 'skip':
+                    conflict = find_filename_collision(cursor, user_id, filename, sha256)
+                    if conflict:
+                        return filename_collision_response(conflict)
+
+                if on_duplicate == 'keep':
+                    cursor.execute("""SELECT id FROM photos
+                        WHERE user_id=%s AND original_filename=%s LIMIT 1""",
+                        (user_id,filename))
+                    if cursor.fetchone():
+                        raise HTTPException(409, 'That filename exists; choose another name')
 
                 quota = account["storage_quota_bytes"]
 
                 if quota is not None:
                     cursor.execute(
                         """
-                        SELECT COALESCE(SUM(size_bytes), 0) AS used
+                        SELECT COALESCE(SUM(size_bytes + resource_bytes), 0) AS used
                         FROM photos WHERE user_id = %s
                         """,
                         (user_id,)
