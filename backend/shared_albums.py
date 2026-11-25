@@ -1,17 +1,20 @@
-"""Shared Albums: references to owner-held originals with server-enforced ACLs.
+from family_group import family_album_id_for_cursor
+"""Shared Albums: admin-managed membership; owner-contributed media.
 
-Admin curates membership/items; members view/download; owners retain existing
-photo/video deletion rights. This router contains NO original-media deletion API.
+Authorized members may add their own original media, view and download all shared
+items, and unshare only items they originally own. No original deletion routes.
 """
 import os
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from io import BytesIO
+from PIL import Image, ImageOps, UnidentifiedImageError
 from urllib.parse import quote
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, Response
 from pydantic import BaseModel, Field
 
 from guard import database
@@ -22,11 +25,6 @@ TICKET_ISSUER = 'locallens-shared-media'
 TICKET_AUDIENCE = 'locallens-shared-stream'
 TICKET_MINUTES = 60
 CHUNK_SIZE = 512 * 1024
-
-
-class AlbumCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=150)
-    description: str = Field(default='', max_length=500)
 
 
 class IdSelection(BaseModel):
@@ -103,11 +101,6 @@ def range_response(path, mime, requested_range, download_name=None):
 def build_shared_album_router(get_connection, get_current_user):
     router = APIRouter(prefix='/api/shared-albums', tags=['Shared Albums'])
 
-    def admin(user):
-        if user['role'] != 'admin':
-            raise HTTPException(403, 'Administrator access required')
-        return user
-
     def allowed_album(cursor, album_id, user):
         cursor.execute('''SELECT a.id,a.name,a.description,a.created_at
             FROM shared_albums a WHERE a.id=%s AND
@@ -169,49 +162,39 @@ def build_shared_album_router(get_connection, get_current_user):
                 WHERE %s='admin' OR EXISTS (SELECT 1 FROM shared_album_members m
                     WHERE m.album_id=a.id AND m.user_id=%s)
                 ORDER BY a.created_at DESC,a.id DESC''', (user['role'], user['id']))
-            return cur.fetchall()
-
-    @router.post('', status_code=201)
-    def create_album(body: AlbumCreate, user=Depends(get_current_user)):
-        admin(user)
-        name = body.name.strip()
-        if not name:
-            raise HTTPException(422, 'Name cannot be empty')
-        with database(get_connection) as (conn, cur):
-            cur.execute('INSERT INTO shared_albums(name,description,created_by) VALUES(%s,%s,%s)',
-                        (name, body.description.strip(), user['id']))
-            album_id = cur.lastrowid
-            conn.commit()
-            return {'id': album_id, 'name': name}
-
-    @router.delete('/{album_id}', status_code=204)
-    def delete_album(album_id: int, user=Depends(get_current_user)):
-        admin(user)
-        with database(get_connection) as (conn, cur):
-            cur.execute('DELETE FROM shared_albums WHERE id=%s', (album_id,))
-            if not cur.rowcount:
-                raise HTTPException(404, 'Shared album not found')
-            conn.commit()
-        # Album references ONLY; no original photos/videos are deleted.
-
-    @router.get('/users')
-    def list_users(user=Depends(get_current_user)):
-        admin(user)
-        with database(get_connection) as (conn, cur):
-            cur.execute('SELECT id,username,display_name FROM users WHERE is_active=1 ORDER BY username')
-            return cur.fetchall()
-
-    @router.get('/owner-media')
-    def owner_media(owner_id: int, search: str = '', limit: int = Query(100,ge=1,le=100),
-                    offset: int = Query(0, ge=0), user=Depends(get_current_user)):
-        admin(user)
-        with database(get_connection) as (conn, cur):
-            cur.execute('''SELECT id,original_filename,mime_type,media_type,uploaded_at,size_bytes
-                FROM photos WHERE user_id=%s AND deleted_at IS NULL
-                AND original_filename LIKE %s
-                ORDER BY uploaded_at DESC,id DESC LIMIT %s OFFSET %s''',
-                (owner_id, '%' + search[:100] + '%', limit, offset))
-            return cur.fetchall()
+            albums = cur.fetchall()
+            # ll_random_cover: choose a different original photo when the
+            # Albums tab fetches this list. Random seek avoids ORDER BY RAND()
+            # over every photo in a large family album.
+            import secrets
+            for album in albums:
+                album['cover_photo_id'] = None
+                cur.execute("""SELECT MIN(i.photo_id) AS lo, MAX(i.photo_id) AS hi
+                    FROM shared_album_items i JOIN photos p ON p.id=i.photo_id
+                    JOIN users u ON u.id=p.user_id
+                    WHERE i.album_id=%s AND p.deleted_at IS NULL
+                      AND u.is_active=1 AND COALESCE(p.media_type,'photo') <> 'video'""",
+                    (album['id'],))
+                bounds = cur.fetchone()
+                if not bounds or bounds['lo'] is None:
+                    continue
+                threshold = secrets.randbelow(int(bounds['hi']) - int(bounds['lo']) + 1) + int(bounds['lo'])
+                for condition, params in (
+                    ('AND i.photo_id >= %s', (album['id'], threshold)),
+                    ('', (album['id'],)),
+                ):
+                    cur.execute(f"""SELECT i.photo_id AS id
+                        FROM shared_album_items i JOIN photos p ON p.id=i.photo_id
+                        JOIN users u ON u.id=p.user_id
+                        WHERE i.album_id=%s AND p.deleted_at IS NULL
+                          AND u.is_active=1 AND COALESCE(p.media_type,'photo') <> 'video'
+                          {condition}
+                        ORDER BY i.photo_id LIMIT 1""", params)
+                    chosen = cur.fetchone()
+                    if chosen:
+                        album['cover_photo_id'] = chosen['id']
+                        break
+            return albums
 
     @router.get('/{album_id}')
     def get_album(album_id: int, limit: int = Query(100, ge=1, le=200),
@@ -235,72 +218,90 @@ def build_shared_album_router(get_connection, get_current_user):
                 members = [row['user_id'] for row in cur.fetchall()]
             else:
                 members = []
+            album['is_family'] = family_album_id_for_cursor(cur) == album_id
             return {'album': album, 'items': items, 'members': members,
                     'has_more': has_more}
 
-    @router.post('/{album_id}/members')
-    def add_members(album_id: int, body: IdSelection, user=Depends(get_current_user)):
-        admin(user)
-        ids = unique_ids(body.ids)
-        with database(get_connection) as (conn, cur):
-            allowed_album(cur, album_id, user)
-            placeholders = ','.join(['%s'] * len(ids))
-            cur.execute(f'SELECT id FROM users WHERE id IN ({placeholders}) AND is_active=1', tuple(ids))
-            found = {row['id'] for row in cur.fetchall()}
-            if found != set(ids):
-                raise HTTPException(422, 'Unknown or disabled user in selection')
-            cur.executemany('INSERT IGNORE INTO shared_album_members(album_id,user_id) VALUES(%s,%s)',
-                            [(album_id, i) for i in ids])
-            conn.commit()
-            return {'added': len(ids)}
-
-    @router.delete('/{album_id}/members/{member_id}', status_code=204)
-    def remove_member(album_id: int, member_id: int, user=Depends(get_current_user)):
-        admin(user)
-        with database(get_connection) as (conn, cur):
-            allowed_album(cur, album_id, user)
-            cur.execute('DELETE FROM shared_album_members WHERE album_id=%s AND user_id=%s',
-                        (album_id, member_id))
-            conn.commit()
-
     @router.post('/{album_id}/items')
     def add_items(album_id: int, body: IdSelection, user=Depends(get_current_user)):
-        admin(user)
         ids = unique_ids(body.ids)
         with database(get_connection) as (conn, cur):
             allowed_album(cur, album_id, user)
             placeholders = ','.join(['%s'] * len(ids))
-            cur.execute(f'''SELECT p.id FROM photos p JOIN users u ON u.id=p.user_id
-                WHERE p.id IN ({placeholders}) AND p.deleted_at IS NULL AND u.is_active=1''', tuple(ids))
+            cur.execute(f"""SELECT p.id FROM photos p WHERE p.user_id=%s
+                AND p.id IN ({placeholders}) AND p.deleted_at IS NULL""",
+                (user['id'], *ids))
             if {r['id'] for r in cur.fetchall()} != set(ids):
-                raise HTTPException(422, 'One or more media items are unavailable')
+                raise HTTPException(403, 'You may only share your own available media')
             cur.executemany('INSERT IGNORE INTO shared_album_items(album_id,photo_id) VALUES(%s,%s)',
                             [(album_id, i) for i in ids])
             conn.commit()
             return {'added': len(ids)}
 
-    @router.delete('/{album_id}/items/{photo_id}', status_code=204)
-    def remove_item(album_id: int, photo_id: int, user=Depends(get_current_user)):
-        admin(user)
+    @router.post('/{album_id}/items/remove-owned')
+    def remove_owned_items(album_id: int, body: IdSelection, user=Depends(get_current_user)):
+        # Owner-only, batch removal. Unsharing never deletes an original or thumbnail.
+        ids = unique_ids(body.ids)
+        marks = ','.join(['%s'] * len(ids))
         with database(get_connection) as (conn, cur):
             allowed_album(cur, album_id, user)
-            cur.execute('DELETE FROM shared_album_items WHERE album_id=%s AND photo_id=%s',
-                        (album_id, photo_id))
+            cur.execute(f"""SELECT i.photo_id FROM shared_album_items i
+                JOIN photos p ON p.id=i.photo_id
+                WHERE i.album_id=%s AND p.user_id=%s
+                  AND i.photo_id IN ({marks})""", (album_id, user['id'], *ids))
+            if {row['photo_id'] for row in cur.fetchall()} != set(ids):
+                raise HTTPException(403, 'Only the original owner may remove shared items')
+            cur.execute(f"DELETE FROM shared_album_items WHERE album_id=%s AND photo_id IN ({marks})",
+                        (album_id, *ids))
+            count = cur.rowcount
             conn.commit()
-        # Remove the share reference, NOT the original.
+        return {'removed': count}
 
-    @router.get('/owner-media/{photo_id}/thumbnail')
-    def owner_thumbnail(photo_id: int, owner_id: int, user=Depends(get_current_user)):
-        admin(user)
+    @router.delete('/{album_id}/items/{photo_id}', status_code=204)
+    def remove_item(album_id: int, photo_id: int, user=Depends(get_current_user)):
         with database(get_connection) as (conn, cur):
-            cur.execute('''SELECT user_id,thumbnail_path FROM photos WHERE id=%s
-                AND user_id=%s AND deleted_at IS NULL''', (photo_id, owner_id))
-            media = cur.fetchone()
-        if not media:
-            raise HTTPException(404, 'Media unavailable')
-        path = safe_media_path(owner_id, media['thumbnail_path'], 'thumbnails')
-        return FileResponse(path, media_type='image/jpeg', headers={
-            'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff'})
+            allowed_album(cur, album_id, user)
+            # Admin access does NOT override original ownership.
+            cur.execute("""SELECT p.user_id FROM shared_album_items i
+                JOIN photos p ON p.id=i.photo_id
+                WHERE i.album_id=%s AND i.photo_id=%s""", (album_id,photo_id))
+            item = cur.fetchone()
+            if not item:
+                raise HTTPException(404, 'Shared item not found')
+            if item['user_id'] != user['id']:
+                raise HTTPException(403, 'Only the original owner may remove this item')
+            cur.execute('DELETE FROM shared_album_items WHERE album_id=%s AND photo_id=%s',
+                        (album_id,photo_id))
+            conn.commit()
+        # Unshares only, never touches original storage or the trash.
+
+    @router.get('/{album_id}/media/{photo_id}/preview')
+    def authorized_preview(album_id: int, photo_id: int,
+                           user=Depends(get_current_user)):
+        # Verify member access on EVERY request, even a previously viewed item.
+        with database(get_connection) as (_, cur):
+            _, media = album_media(cur, album_id, photo_id, user)
+        if media['media_type'] == 'video' or media['mime_type'].startswith('video/'):
+            raise HTTPException(415, 'Not an image')
+        path = safe_media_path(media['user_id'], media['storage_path'], 'originals')
+        mime = media['mime_type'].lower()
+        headers = {'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff'}
+        if mime in ('image/jpeg','image/png','image/webp','image/gif'):
+            return FileResponse(path, media_type=mime, headers=headers)
+        # Convert unsupported browser formats (including HEIC) without modifying
+        # the stored original. Pixel dimensions are bounded for safe viewing.
+        try:
+            with Image.open(path) as opened:
+                oriented = ImageOps.exif_transpose(opened)
+                oriented.thumbnail((2500, 2500))
+                if oriented.mode != 'RGB':
+                    oriented = oriented.convert('RGB')
+                buffer = BytesIO()
+                oriented.save(buffer, format='JPEG', quality=84)
+            return Response(content=buffer.getvalue(), media_type='image/jpeg', headers=headers)
+        except (UnidentifiedImageError, OSError, ValueError):
+            thumbnail_path = safe_media_path(media['user_id'], media['thumbnail_path'], 'thumbnails')
+            return FileResponse(thumbnail_path, media_type='image/jpeg', headers=headers)
 
     @router.get('/{album_id}/media/{photo_id}/thumbnail')
     def thumbnail(album_id: int, photo_id: int, user=Depends(get_current_user)):
@@ -332,6 +333,89 @@ def build_shared_album_router(get_connection, get_current_user):
         token = make_ticket(user['id'], album_id, photo_id, 'motion')
         return {'url': f'/api/shared-albums/{album_id}/media/{photo_id}/motion-download?ticket={quote(token)}',
                 'expires_in': TICKET_MINUTES * 60}
+
+    @router.post('/{album_id}/media/{photo_id}/motion-play-url')
+    def motion_play_url(album_id: int, photo_id: int, user=Depends(get_current_user)):
+        """Issue a short-lived playback ticket only to authorized shared-album members."""
+        with database(get_connection) as (conn, cur):
+            album_media(cur, album_id, photo_id, user)
+            cur.execute("""SELECT 1 FROM photo_resources
+                WHERE photo_id=%s AND resource_type='live_video' LIMIT 1""", (photo_id,))
+            if not cur.fetchone():
+                raise HTTPException(404, 'Live Photo motion file unavailable')
+        ticket = make_ticket(user['id'], album_id, photo_id, 'motion_stream')
+        return {
+            'url': f'/api/shared-albums/{album_id}/media/{photo_id}/motion-stream?ticket={quote(ticket)}',
+            'expires_in': TICKET_MINUTES * 60,
+        }
+
+    @router.get('/{album_id}/media/{photo_id}/motion-stream')
+    def motion_stream(album_id: int, photo_id: int, request: Request, ticket: str):
+        """Stream the original companion MOV with Range support; no file copying."""
+        with database(get_connection) as (conn, cur):
+            user = ticket_user(cur, ticket, album_id, photo_id, 'motion_stream')
+            _, photo = album_media(cur, album_id, photo_id, user)
+            cur.execute("""SELECT storage_path FROM photo_resources
+                WHERE photo_id=%s AND resource_type='live_video' LIMIT 1""", (photo_id,))
+            motion = cur.fetchone()
+        if not motion:
+            raise HTTPException(404, 'Live Photo motion file unavailable')
+        original = safe_media_path(photo['user_id'], motion['storage_path'], 'resources')
+        return range_response(original, 'video/quicktime', request.headers.get('range'))
+
+    @router.post('/{album_id}/media/{photo_id}/bundle-access-url')
+    def bundle_access_url(album_id: int, photo_id: int, user=Depends(get_current_user)):
+        # Authenticate member and verify that this media is still shared.
+        with database(get_connection) as (conn, cur):
+            album_media(cur, album_id, photo_id, user)
+        token = make_ticket(user['id'], album_id, photo_id, 'all_originals')
+        return {'url': f'/api/shared-albums/{album_id}/media/{photo_id}/bundle-download?ticket={quote(token)}',
+                'expires_in': TICKET_MINUTES * 60}
+
+    @router.get('/{album_id}/media/{photo_id}/bundle-download')
+    def bundle_download(album_id: int, photo_id: int, ticket: str):
+        import os
+        import shutil
+        import tempfile
+        import zipfile
+        from starlette.background import BackgroundTask
+        with database(get_connection) as (conn, cur):
+            user = ticket_user(cur, ticket, album_id, photo_id, 'all_originals')
+            _, media = album_media(cur, album_id, photo_id, user)
+            cur.execute("""SELECT storage_path,original_filename FROM photo_resources
+                           WHERE photo_id=%s AND resource_type='live_video' LIMIT 1""", (photo_id,))
+            motion = cur.fetchone()
+        original = safe_media_path(media['user_id'], media['storage_path'], 'originals')
+        private_headers = {'Cache-Control': 'private, no-store', 'Referrer-Policy': 'no-referrer',
+                           'X-Content-Type-Options': 'nosniff'}
+        if not motion:
+            return FileResponse(original, media_type='application/octet-stream',
+                                filename=media['original_filename'], content_disposition_type='attachment',
+                                headers=private_headers)
+        video = safe_media_path(media['user_id'], motion['storage_path'], 'resources')
+        if shutil.disk_usage(video.parent).free < (int(os.getenv('MIN_FREE_DISK_GB', '10')) * 1024**3) + original.stat().st_size + video.stat().st_size + 65536:
+            raise HTTPException(507, 'Insufficient storage to prepare complete originals')
+        fd, filename = tempfile.mkstemp(prefix='.ll-bundle-', suffix='.zip', dir=str(video.parent))
+        os.close(fd)
+        archive_path = Path(filename)
+        try:
+            still_name = Path(str(media['original_filename']).replace('\\', '/')).name
+            motion_name = Path(str(motion['original_filename']).replace('\\', '/')).name
+            if still_name in ('', '.', '..') or motion_name in ('', '.', '..'):
+                raise HTTPException(422, 'Original file name unavailable')
+            if still_name.casefold() == motion_name.casefold():
+                motion_name = 'motion-' + motion_name
+            with zipfile.ZipFile(archive_path, 'w', compression=zipfile.ZIP_STORED,
+                                 allowZip64=True) as archive:
+                archive.write(original, arcname=still_name)
+                archive.write(video, arcname=motion_name)
+            return FileResponse(archive_path, media_type='application/zip',
+                                filename=f'LivePhoto-{photo_id}.zip', content_disposition_type='attachment',
+                                headers=private_headers,
+                                background=BackgroundTask(archive_path.unlink, missing_ok=True))
+        except Exception:
+            archive_path.unlink(missing_ok=True)
+            raise
 
     @router.get('/{album_id}/media/{photo_id}/motion-download')
     def motion_download(album_id: int, photo_id: int, ticket: str):

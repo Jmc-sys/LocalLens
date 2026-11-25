@@ -1,0 +1,21 @@
+# Merge after docker-compose.yml; launch using the commands in README.
+services:
+  location-indexer:
+    build:
+      context: .
+      dockerfile: ai/Dockerfile.location
+    env_file: .env
+    environment:
+      DB_HOST: db
+      DB_PORT: '3306'
+      MEDIA_ROOT: /storage
+      LOCATION_CITY_RADIUS_KM: '30'
+      LOCATION_BATCH_LIMIT: '10'
+      LOCATION_PHOTO_PAUSE_SEC: '1.0'
+    volumes_from:
+      - backend:ro
+    depends_on:
+      - db
+    cpus: '0.5'
+    mem_limit: 700m
+    restart: unless-stopped

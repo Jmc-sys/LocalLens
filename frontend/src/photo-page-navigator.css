@@ -1,0 +1,11 @@
+.ll-page-nav { display: flex; flex-direction: column; align-items: center; gap: 0.8rem; margin: 1rem 0 1.5rem; padding: 0.6rem; }
+.ll-page-nav-buttons, .ll-page-nav-numbers, .ll-page-nav-entry, .ll-page-nav-jump, .ll-page-nav-form { display: flex; align-items: center; justify-content: center; gap: 0.35rem; flex-wrap: wrap; }
+.ll-page-nav-buttons .secondary-button { min-width: 2.3rem; padding: 0.45rem 0.65rem; }
+.ll-page-nav-active { font-weight: 750; border-color: currentColor; box-shadow: inset 0 0 0 1px currentColor; opacity: 1 !important; }
+.ll-page-nav-ellipsis { padding: 0.15rem; opacity: 0.7; }
+.ll-page-nav-jump { gap: 1rem; font-size: 0.9rem; }
+.ll-page-nav-current { white-space: nowrap; }
+.ll-page-nav-form label { font-size: 0.86rem; }
+.ll-page-nav-form input { width: 5.5rem; padding: 0.45rem 0.4rem; border: 1px solid var(--border-color, #8995a1); border-radius: 0.4rem; font: inherit; background: var(--input-bg, transparent); color: inherit; }
+.ll-page-nav-error { margin: 0; font-size: 0.82rem; color: #ce3b3b; }
+@media (max-width: 680px) { .ll-page-nav-buttons { gap: 0.25rem; } .ll-page-nav-buttons .secondary-button { padding: 0.35rem 0.45rem; } }

@@ -1,0 +1,12 @@
+/* LocalLens: fullscreen-photo tag autocomplete, no second scrolling area. */
+.ll-v615-suggestions{display:grid;gap:6px;min-width:0;margin:4px 0 2px}
+.ll-v615-suggestions-label{font-size:.72rem;opacity:.75}
+.ll-v615-suggestions-items{display:flex;align-items:center;flex-wrap:wrap;gap:6px}
+.ll-v615-suggestion{border:1px solid rgba(160,176,203,.4);background:rgba(160,176,203,.1);color:inherit;border-radius:30px;padding:5px 9px;font-size:.76rem;cursor:pointer;max-width:100%;overflow-wrap:anywhere}
+.ll-v615-suggestion:hover,.ll-v615-suggestion:focus-visible{border-color:currentColor;background:rgba(160,176,203,.2)}
+.ll-v615-suggestion>span{opacity:.62;font-size:.7rem}
+.ll-v615-suggestion:disabled{opacity:.5;cursor:wait}
+.ll-v615-popular-tags{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:4px 0 10px}
+.ll-v615-popular-tags>span{font-size:.74rem;opacity:.68;margin-right:2px}
+.ll-v615-popular-tags>button{color:inherit;background:rgba(160,176,203,.1);border:1px solid rgba(160,176,203,.35);border-radius:22px;cursor:pointer;padding:4px 9px;font-size:.75rem}
+.ll-v615-popular-tags>button:hover{border-color:currentColor}

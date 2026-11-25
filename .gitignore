@@ -50,3 +50,14 @@ coverage/
 .idea/
 .DS_Store
 Thumbs.db
+
+# LocalLens private uploads and generated AI assets
+**/uploads/
+/ai/models/
+/ai/*.onnx
+/ai/*.pt
+/ai/*.pth
+/ai/*.safetensors
+
+# Temporary source backups
+/frontend/src/*.before-*

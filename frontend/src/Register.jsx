@@ -213,7 +213,7 @@ export default function Register({
       </div>
 
       <footer>
-        <span>LocalLens v0.3.0</span>
+        <span>LocalLens v0.6.20</span>
         <span>Self-hosted photo management</span>
       </footer>
     </main>

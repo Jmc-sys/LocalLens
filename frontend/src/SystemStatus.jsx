@@ -79,7 +79,7 @@ export default function App() {
       </section>
 
       <footer>
-        <span>LocalLens v0.1.0</span>
+        <span>LocalLens v0.6.20</span>
         <span>Self-hosted photo management</span>
       </footer>
     </main>

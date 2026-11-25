@@ -1,0 +1,6 @@
+FROM python:3.12-slim
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+RUN pip install --no-cache-dir 'mysql-connector-python>=9.0,<10' 'Pillow>=11,<13' 'pillow-heif>=1,<2' 'geonamescache==3.0.2'
+WORKDIR /opt/locallens-location
+COPY ai/location_tags.py /opt/locallens-location/location_tags.py
+CMD ["python", "-u", "/opt/locallens-location/location_tags.py"]

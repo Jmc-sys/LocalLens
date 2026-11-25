@@ -1,0 +1,27 @@
+# Use with: docker compose -f docker-compose.yml -f ai/compose.ai.yml run --rm ai-indexer --limit 100
+# This optional container uses the same private /storage volume as the backend.
+services:
+  ai-indexer:
+    build:
+      context: .
+      dockerfile: ai/Dockerfile
+    env_file: .env
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      DB_NAME: ${DB_NAME:-locallens}
+      DB_USER: ${DB_USER:-locallens}
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      MEDIA_ROOT: /storage
+      HF_HOME: /models
+      AI_THREADS: "2"
+    volumes_from:
+      - backend:ro
+    volumes:
+      - locallens_ai_models:/models
+    depends_on:
+      - db
+    profiles: [ai]
+    restart: "no"
+volumes:
+  locallens_ai_models:

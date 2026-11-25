@@ -43,33 +43,51 @@ async function liveBlob(id, type, signal) {
 }
 
 export function LiveViewer({ photo, children }) {
-  const [playing,setPlaying] = useState(false);
-  const [url,setUrl] = useState("");
-  const [error,setError] = useState("");
-  useEffect(()=>{
+  const [playing, setPlaying] = useState(true);
+  const [ready, setReady] = useState(false);
+  const [url, setUrl] = useState("");
+  const [error, setError] = useState("");
+  const video = useRef(null);
+  useEffect(() => {
+    setPlaying(true); setReady(false); setUrl(""); setError("");
+  }, [photo.id]);
+  useEffect(() => {
     if (!playing) return;
-    const controller=new AbortController(); let objectUrl;
-    setError(""); setUrl("");
-    liveBlob(photo.id,"preview",controller.signal).then(blob=>{
-      if(controller.signal.aborted) return;
-      objectUrl=URL.createObjectURL(blob); setUrl(objectUrl);
-    }).catch(e=>{if(!controller.signal.aborted) setError(e.message);});
-    return ()=>{controller.abort(); if(objectUrl) URL.revokeObjectURL(objectUrl);};
-  },[playing,photo.id]);
-  async function downloadOriginals(){
-    try {
-      const blob=await liveBlob(photo.id,"originals");
-      const link=document.createElement("a"); link.href=URL.createObjectURL(blob);
-      link.download=`LivePhoto-${photo.id}.zip`; link.click();
-      setTimeout(()=>URL.revokeObjectURL(link.href),1000);
-    } catch(e){setError(e.message);}
+    const controller = new AbortController();
+    let objectUrl = null;
+    setReady(false);
+    setError("");
+    liveBlob(photo.id, "preview", controller.signal).then(blob => {
+      if (controller.signal.aborted) return;
+      objectUrl = URL.createObjectURL(blob);
+      setUrl(objectUrl);
+    }).catch(e => { if (!controller.signal.aborted) setError(e.message); });
+    return () => {
+      controller.abort();
+      try { video.current?.pause(); } catch { /* Unmounted. */ }
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [playing, photo.id]);
+  function showPhotoOnly() {
+    try { video.current?.pause(); } catch { /* Already paused. */ }
+    setPlaying(false); setReady(false); setUrl("");
   }
+
   return <div className="live-viewer">
     <div className="live-controls">
-      <button className="secondary-button" onClick={()=>setPlaying(p=>!p)}>{playing?"Show still":"▶ Play Live Photo"}</button>
-      <button className="secondary-button" onClick={downloadOriginals}>Download both originals</button>
+      <button type="button" className="secondary-button" onClick={() => playing ? showPhotoOnly() : setPlaying(true)}>
+        {playing ? "Show photo only" : "▶ Play Live Photo"}
+      </button>
+
     </div>
-    {error && <p role="alert">{error}</p>}
-    {playing ? (url ? <video src={url} controls autoPlay playsInline onError={()=>setError("Browser could not play preview.")}/> : <p>{error?"Preview unavailable":"Preparing motion preview…"}</p>) : children}
+    {error && <p role="alert" className="error-message">Motion unavailable: {error}. Still photo remains visible.</p>}
+    <div className="ll-live-stage">
+      <div className="ll-live-still" aria-hidden={playing && ready}>{children}</div>
+      {playing && url && <video ref={video} key={`${photo.id}-${url}`} src={url}
+        autoPlay muted loop playsInline preload="auto" controls={false}
+        className={ready ? "ll-live-motion ll-live-ready" : "ll-live-motion"}
+        onCanPlay={() => setReady(true)}
+        onError={() => { setReady(false); setError("Your browser cannot play this motion format"); }} />}
+    </div>
   </div>;
 }

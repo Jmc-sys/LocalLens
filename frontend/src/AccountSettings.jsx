@@ -1,3 +1,6 @@
+import LocalLensPasswordPanel from "./LocalLensPasswordPanel";
+import AiOperations from "./AiOperations";
+import AiPetReview from "./AiPetReview";
 import SessionSettings from "./SessionSettings";
 import { useEffect, useState } from "react";
 import { api, logout } from "./api";
@@ -21,7 +24,7 @@ export function formatBytes(bytes) {
   return `${(value / 1024 ** i).toFixed(2)} ${units[i]}`;
 }
 
-export default function AccountSettings({
+function AccountSettings({
   user,
   onUpdate,
 }) {
@@ -217,7 +220,8 @@ export default function AccountSettings({
       <section className="status-card settings-card">
         <h2>Change password</h2>
 
-        <form onSubmit={changePassword}>
+        <LocalLensPasswordPanel>
+<form onSubmit={changePassword}>
           <label>Current password</label>
           <input
             type="password"
@@ -260,6 +264,7 @@ export default function AccountSettings({
             Change password
           </button>
         </form>
+</LocalLensPasswordPanel>
       </section>
  
       <SessionSettings />
@@ -267,4 +272,14 @@ export default function AccountSettings({
       <TrashRetentionSettings />
     </section>
   );
+}
+
+// The original Settings component remains unchanged; facial identity review is
+// appended only on the user's Settings screen.
+export default function SettingsWithAI(props) {
+  return <>
+    <AiOperations />
+    <AiPetReview />
+    <AccountSettings {...props} />
+  </>;
 }

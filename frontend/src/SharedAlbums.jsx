@@ -1,301 +1,326 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, getToken } from "./api";
+import ViewerNavigation from "./ViewerNavigation";
 
-function ProtectedThumbnail({ url, label }) {
-  const [blobUrl, setBlobUrl] = useState("");
+// Shared media is never fetched via owner-only /photos routes.
+// The backend authenticates each request and enforces membership and ownership.
+export function AuthorizedImage({ url, alt, eager = false }) {
+  const visibilityAnchor = useRef(null);
+  const [visible, setVisible] = useState(eager);
+  const [src, setSrc] = useState("");
   useEffect(() => {
-    const ctrl = new AbortController();
+    setVisible(eager);
+    if (eager) return;
+    if (typeof IntersectionObserver === "undefined") { setVisible(true); return; }
+    const anchor = visibilityAnchor.current;
+    if (!anchor) { setVisible(true); return; }
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some(entry => entry.isIntersecting)) {
+        setVisible(true);
+        observer.disconnect();
+      }
+    }, { rootMargin: "300px" });
+    observer.observe(anchor);
+    return () => observer.disconnect();
+  }, [url, eager]);
+  useEffect(() => {
+    if (!visible) return;
+    const controller = new AbortController();
     let objectUrl = null;
-    setBlobUrl("");
+    setSrc("");
     (async () => {
       try {
         const response = await fetch(url, {
-          headers: { Authorization: `Bearer ${getToken() || ""}` }, signal: ctrl.signal,
+          headers: { Authorization: `Bearer ${getToken() || ""}` },
+          signal: controller.signal,
         });
-        if (!response.ok) return;
+        if (!response.ok) throw new Error(`Image unavailable (${response.status})`);
         const blob = await response.blob();
-        if (ctrl.signal.aborted) return;
-        objectUrl = URL.createObjectURL(blob);
-        setBlobUrl(objectUrl);
-      } catch (error) { if (!ctrl.signal.aborted) console.warn("Thumbnail unavailable", error); }
+        if (!controller.signal.aborted) {
+          objectUrl = URL.createObjectURL(blob);
+          setSrc(objectUrl);
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) console.warn("Shared image unavailable", error);
+      }
     })();
-    return () => { ctrl.abort(); if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [url]);
-  return blobUrl ? <img src={blobUrl} alt={label || "Media thumbnail"} loading="lazy" />
-    : <span className="shared-thumbnail-placeholder" aria-hidden="true">▧</span>;
+    return () => { controller.abort(); if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [url, visible]);
+  return src ? <img src={src} alt={alt} loading="lazy" decoding="async" />
+    : <span ref={visibilityAnchor} className="image-placeholder" aria-label="Loading shared image">Loading preview…</span>;
 }
 
-function openProtectedDownload(url) {
-  const link = document.createElement("a");
-  link.href = url;
-  link.rel = "noreferrer";
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
+function browserDownload(url) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.rel = "noreferrer";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
-export default function SharedAlbums() {
+const PAGE_SIZE = 100;
+
+export default function SharedAlbums({ embedded = false, onOpenChange, openedAlbumId = null, onBack }) {
   const [me, setMe] = useState(null);
   const [albums, setAlbums] = useState([]);
-  const [albumId, setAlbumId] = useState(null);
+  const [albumId, setAlbumId] = useState(openedAlbumId);
   const [detail, setDetail] = useState(null);
-  const [users, setUsers] = useState([]);
-  const [albumName, setAlbumName] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [loadingDetail, setLoadingDetail] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [ownerId, setOwnerId] = useState("");
-  const [search, setSearch] = useState("");
-  const [candidatePage, setCandidatePage] = useState(0);
-  const [candidates, setCandidates] = useState([]);
-  const [chosen, setChosen] = useState(new Set());
-  const [candidateMore, setCandidateMore] = useState(false);
-  const [itemsOffset, setItemsOffset] = useState(0);
+  const [selected, setSelected] = useState([]);
   const [viewer, setViewer] = useState(null);
   const [videoUrl, setVideoUrl] = useState("");
-  const [isWorking, setIsWorking] = useState(false);
-  const isAdmin = me?.role === "admin";
+  const [motionUrl, setMotionUrl] = useState("");
+  const [motionReady, setMotionReady] = useState(false);
+  const [motionLoading, setMotionLoading] = useState(false);
+  const [motionPlaybackError, setMotionPlaybackError] = useState("");
+  const motionRequest = useRef(0);
 
-  async function refreshAlbums() { setAlbums(await api("/shared-albums")); }
-  async function refreshDetail(id, offset = 0, append = false) {
-    const data = await api(`/shared-albums/${id}?limit=100&offset=${offset}`);
-    setDetail(old => append && old && old.album.id === id
-      ? { ...data, items: [...old.items, ...data.items] }
-      : data);
-    setItemsOffset(offset);
+  function clearMotionPlayback() {
+    motionRequest.current += 1; // Invalidate a pending signed-URL response.
+    setMotionUrl("");
+    setMotionReady(false);
+    setMotionLoading(false);
+    setMotionPlaybackError("");
   }
+  const [busy, setBusy] = useState(false);
+  const [offset, setOffset] = useState(0);
 
+  useEffect(() => { onOpenChange?.(!!albumId); }, [albumId, onOpenChange]);
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      try {
-        const identity = await api("/auth/me");
-        const [listed, directory] = await Promise.all([
-          api("/shared-albums"),
-          identity.role === "admin" ? api("/shared-albums/users") : Promise.resolve([]),
-        ]);
-        if (cancelled) return;
-        setMe(identity); setAlbums(listed); setUsers(directory);
-      } catch (e) { if (!cancelled) setError(e.message); }
-      finally { if (!cancelled) setLoading(false); }
-    })();
+    Promise.all([api("/auth/me"), openedAlbumId != null ? Promise.resolve([]) : api("/shared-albums")])
+      .then(([identity, list]) => { if (!cancelled) { setMe(identity); setAlbums(list); } })
+      .catch(e => { if (!cancelled) setError(e.message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
-    if (!albumId) { setDetail(null); return; }
+    if (!albumId) { setDetail(null); setViewer(null); setSelected([]); clearMotionPlayback(); return; }
     let cancelled = false;
-    setDetail(null); setViewer(null);
-    api(`/shared-albums/${albumId}?limit=100&offset=0`)
-      .then(data => { if (!cancelled) { setDetail(data); setItemsOffset(0); } })
-      .catch(e => { if (!cancelled) setError(e.message); });
+    setLoadingDetail(true);
+    setError(""); setNotice(""); setSelected([]); setViewer(null); clearMotionPlayback(); setDetail(null);
+    api(`/shared-albums/${albumId}?limit=${PAGE_SIZE}&offset=0`)
+      .then(data => { if (!cancelled) { setDetail(data); setOffset(0); } })
+      .catch(e => { if (!cancelled) setError(e.message); })
+      .finally(() => { if (!cancelled) setLoadingDetail(false); });
     return () => { cancelled = true; };
   }, [albumId]);
 
   useEffect(() => {
-    if (!isAdmin || !ownerId || !albumId) { setCandidates([]); setCandidateMore(false); return; }
-    let cancelled = false;
-    const timer = setTimeout(() => {
-      const params = new URLSearchParams({ owner_id: ownerId, search, offset: String(candidatePage * 100), limit: "100" });
-      api(`/shared-albums/owner-media?${params}`)
-        .then(data => { if (!cancelled) { setCandidates(data); setCandidateMore(data.length === 100); } })
-        .catch(e => { if (!cancelled) setError(e.message); });
-    }, 150);
-    return () => { cancelled = true; clearTimeout(timer); };
-  }, [albumId, isAdmin, ownerId, candidatePage, search]);
+    const handler = (event) => {
+      if (event.key === "Escape") closeSharedViewer();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
 
-  async function perform(operation, message = "") {
-    setError(""); setNotice(""); setIsWorking(true);
-    try { await operation(); if (message) setNotice(message); }
-    catch (e) { setError(e.message); }
-    finally { setIsWorking(false); }
+  const items = detail?.items || [];
+  const ownItems = useMemo(() => items.filter(item => Number(item.user_id) === Number(me?.id)), [items, me?.id]);
+  const ownSelected = useMemo(() => selected.filter(id => ownItems.some(item => item.id === id)), [selected, ownItems]);
+
+  async function refresh(offsetToLoad = 0, append = false) {
+    const data = await api(`/shared-albums/${albumId}?limit=${PAGE_SIZE}&offset=${offsetToLoad}`);
+    setDetail(previous => append && previous?.album?.id === data.album.id
+      ? { ...data, items: [...previous.items, ...data.items] }
+      : data);
+    setOffset(offsetToLoad);
   }
 
-  async function createAlbum(event) {
-    event.preventDefault();
-    const name = albumName.trim();
-    if (!name) return;
-    await perform(async () => {
-      const result = await api("/shared-albums", {
-        method: "POST", body: JSON.stringify({ name }),
-      });
-      setAlbumName("");
-      await refreshAlbums();
-      setAlbumId(result.id);
-    }, "Shared album created. Add members and select media from the owners' libraries.");
-  }
-
-  async function setMembership(userId, isMember) {
-    if (!albumId) return;
-    await perform(async () => {
-      if (isMember) await api(`/shared-albums/${albumId}/members/${userId}`, { method: "DELETE" });
-      else await api(`/shared-albums/${albumId}/members`, {
-        method: "POST", body: JSON.stringify({ ids: [userId] }),
-      });
-      await refreshDetail(albumId);
-    }, isMember ? "Album access removed." : "Album access granted.");
-  }
-
-  async function addMedia() {
-    const ids = [...chosen];
-    if (!ids.length) return;
-    await perform(async () => {
-      // In batches to respect the API's bounded transaction limits.
-      for (let start = 0; start < ids.length; start += 100) {
-        await api(`/shared-albums/${albumId}/items`, {
-          method: "POST", body: JSON.stringify({ ids: ids.slice(start, start + 100) }),
+  async function removeSelected() {
+    if (!ownSelected.length || busy) return;
+    if (!window.confirm(`Remove ${ownSelected.length} of your items from this album? The original files will be kept. This cannot remove other users' items.`)) return;
+    setBusy(true); setError(""); setNotice("");
+    try {
+      for (let start = 0; start < ownSelected.length; start += 100) {
+        await api(`/shared-albums/${albumId}/items/remove-owned`, {
+          method: "POST", body: JSON.stringify({ ids: ownSelected.slice(start, start + 100) }),
         });
       }
-      setChosen(new Set());
-      await refreshDetail(albumId);
-      await refreshAlbums();
-    }, `${ids.length} selected item(s) added. The original files remain owned by their users.`);
+      setSelected([]);
+      await refresh(0);
+      setNotice(`${ownSelected.length} items removed from this album. Your originals were kept.`);
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
   }
 
-  async function removeMedia(photoId) {
-    if (!window.confirm("Remove this item from the shared album? The owner's original will not be deleted.")) return;
-    await perform(async () => {
-      await api(`/shared-albums/${albumId}/items/${photoId}`, { method: "DELETE" });
-      await refreshDetail(albumId);
-      await refreshAlbums();
-    }, "Item removed from sharing; original preserved.");
+  function toggleSelected(id) {
+    setSelected(before => before.includes(id) ? before.filter(n => n !== id) : [...before, id]);
   }
 
-  async function removeAlbum() {
-    if (!window.confirm("Delete this shared album and its access list? Original photos and videos remain untouched.")) return;
-    await perform(async () => {
-      await api(`/shared-albums/${albumId}`, { method: "DELETE" });
-      setAlbumId(null); await refreshAlbums();
-    }, "Shared album deleted. Owners' original media was not changed.");
+  async function downloadMedia(item) {
+    try {
+      setError("");
+      const result = await api(`/shared-albums/${albumId}/media/${item.id}/bundle-access-url`, { method: "POST" });
+      if (!result?.url) throw new Error("Original media is unavailable.");
+      browserDownload(result.url);
+    } catch (e) { setError(e.message); }
   }
 
-  async function downloadMedia(item, motion = false) {
-    await perform(async () => {
-      const endpoint = motion ? "motion-access-url" : "access-url";
-      const result = await api(`/shared-albums/${albumId}/media/${item.id}/${endpoint}`, { method: "POST" });
-      const downloadUrl = !motion && result.video ? `${result.url}&download=1` : result.url;
-      openProtectedDownload(downloadUrl);
-    });
+  const sharedVideoRef = useRef(null);
+  const viewerRequest = useRef(0);
+  const pagingRef = useRef(false);
+  function closeSharedViewer() {
+    // Stop video playback and invalidate an in-flight signed URL request.
+    try { sharedVideoRef.current?.pause(); } catch { /* Already stopped. */ }
+    clearMotionPlayback();
+    viewerRequest.current += 1;
+    setVideoUrl("");
+    setViewer(null);
   }
 
-  async function viewMedia(item) {
-    setViewer(item); setVideoUrl("");
-    if (item.media_type === "video") {
-      try {
-        const result = await api(`/shared-albums/${albumId}/media/${item.id}/access-url`, { method: "POST" });
-        setVideoUrl(result.url);
-      } catch (e) { setError(e.message); }
+  useEffect(() => {
+    if (!viewer) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = previous; };
+  }, [viewer]);
+
+  async function playLiveMotion(item) {
+    if (!item.has_live_motion || item.media_type === "video") return;
+    const requestId = ++motionRequest.current;
+    setMotionLoading(true);
+    setMotionUrl("");
+    setMotionPlaybackError("");
+    try {
+      const result = await api(`/shared-albums/${albumId}/media/${item.id}/motion-play-url`, {
+        method: "POST",
+      });
+      if (!result?.url) throw new Error("The motion video could not be opened.");
+      if (motionRequest.current === requestId) setMotionUrl(result.url);
+    } catch (e) {
+      if (motionRequest.current === requestId) setMotionPlaybackError(e.message);
+    } finally {
+      if (motionRequest.current === requestId) setMotionLoading(false);
     }
   }
 
-  if (loading) return <section className="shared-albums-page"><p>Loading shared albums…</p></section>;
+  async function openViewer(item) {
+    const requestId = ++viewerRequest.current;
+    try { sharedVideoRef.current?.pause(); } catch { /* Already stopped. */ }
+    setViewer(item);
+    setVideoUrl(""); clearMotionPlayback(); setError("");
+    if (item.has_live_motion && item.media_type !== "video") {
+      void playLiveMotion(item);
+    }
+    if (item.media_type === "video") {
+      try {
+        const result = await api(`/shared-albums/${albumId}/media/${item.id}/access-url`, { method: "POST" });
+        if (viewerRequest.current === requestId) setVideoUrl(result.url);
+      } catch (e) { if (viewerRequest.current === requestId) setError(e.message); }
+    }
+  }
 
-  return <section className="shared-albums-page">
-    <div className="shared-albums-heading">
-      <div><h2>Shared Albums</h2><p>Private albums for approved members. Originals stay with their owners.</p></div>
-      {albumId && <button className="secondary-button" onClick={() => setAlbumId(null)}>All shared albums</button>}
+  async function nextSharedPage() {
+    if (!detail?.has_more || busy || pagingRef.current) return;
+    pagingRef.current = true;
+    try {
+      const nextOffset = offset + PAGE_SIZE;
+      const next = await api(`/shared-albums/${albumId}?limit=${PAGE_SIZE}&offset=${nextOffset}`);
+      if (!next.items?.length) return;
+      setDetail(previous => previous?.album?.id === next.album.id
+        ? { ...next, items: [...previous.items, ...next.items] }
+        : next);
+      setOffset(nextOffset);
+      void openViewer(next.items[0]);
+    } catch (e) { setError(e.message); }
+    finally { pagingRef.current = false; }
+  }
+
+  if (loading) return <section className="shared-albums-page"><p>Loading family albums…</p></section>;
+
+  return <section className="shared-albums-page photo-library">
+    <div className="library-heading shared-albums-heading">
+      <h2>{albumId && detail ? detail.album.name : embedded ? "Family albums" : "Shared albums"}</h2>
+      {albumId && <button type="button" className="secondary-button" onClick={() => onBack ? onBack() : setAlbumId(null)}>Back to albums</button>}
     </div>
-    {error && <p role="alert" className="error-message">{error}</p>}
-    {notice && <p role="status" className="shared-albums-notice">{notice}</p>}
+    {error && <p className="error-message" role="alert">{error}</p>}
+    {notice && <p className="shared-albums-notice" role="status">{notice}</p>}
 
-    {!albumId ? <>
-      {isAdmin && <form className="shared-albums-create" onSubmit={createAlbum}>
-        <label htmlFor="shared-new-name">New shared album</label>
-        <input id="shared-new-name" placeholder="e.g. Family Photos" maxLength={150}
-          value={albumName} onChange={e => setAlbumName(e.target.value)} />
-        <button className="primary-button" type="submit" disabled={isWorking || !albumName.trim()}>Create album</button>
-      </form>}
-      <div className="shared-album-grid">
-        {albums.map(album => <button className="shared-album-tile" key={album.id} onClick={() => setAlbumId(album.id)}>
+    {!albumId ? <div className="album-grid">
+      {albums.map(album => <article className="album-card" key={album.id}>
+        <button type="button" className="album-cover shared-family-card" onClick={() => setAlbumId(album.id)}>
+          <span aria-hidden="true">▧</span>
           <strong>{album.name}</strong>
-          <span>{album.item_count} media items · {album.member_count} members</span>
-        </button>)}
-        {!albums.length && <p>{isAdmin ? "No shared albums yet. Create one to get started." : "No shared albums have been shared with you yet."}</p>}
+        </button>
+        <h3>{album.name}</h3>
+        <p>{Number(album.item_count || 0).toLocaleString()} items · Shared</p>
+      </article>)}
+      {!albums.length && <p>No family albums are available for your account.</p>}
+    </div> : loadingDetail ? <p>Loading album…</p> : detail ? <>
+      <div className="library-toolbar">
+        <span>{items.length.toLocaleString()} items loaded</span>
+        <button type="button" className="secondary-button" disabled={!ownItems.length || busy}
+          onClick={() => setSelected(ownItems.map(item => item.id))}>Select my items</button>
       </div>
-    </> : !detail ? <p>Loading album…</p> : <>
-      <header className="shared-album-detail-header">
-        <div><h3>{detail.album.name}</h3><p>{detail.album.description || "Shared photos and videos"}</p></div>
-        {isAdmin && <button className="secondary-button" disabled={isWorking} onClick={removeAlbum}>Delete shared album</button>}
-      </header>
-
-      {isAdmin && <div className="shared-admin-panels">
-        <section className="shared-admin-panel" aria-label="Album members">
-          <h4>Who has access</h4>
-          <p>Only selected users can open and download from this album.</p>
-          <div className="shared-member-list">
-            {users.map(u => <label key={u.id}>
-              <input type="checkbox" disabled={isWorking}
-                checked={detail.members.includes(u.id)}
-                onChange={() => setMembership(u.id, detail.members.includes(u.id))} />
-              <span>{u.display_name || u.username} <small>({u.username})</small></span>
-            </label>)}
-          </div>
-        </section>
-        <section className="shared-admin-panel" aria-label="Add owner media">
-          <h4>Add photos or videos</h4>
-          <p>Select an owner, then choose media to share. No copies are created.</p>
-          <label>Media owner
-            <select value={ownerId} onChange={e => { setOwnerId(e.target.value); setCandidatePage(0); setChosen(new Set()); }}>
-              <option value="">Select a user</option>
-              {users.map(u => <option key={u.id} value={String(u.id)}>{u.username}</option>)}
-            </select>
-          </label>
-          {ownerId && <>
-            <input placeholder="Search this user's filenames" value={search}
-              onChange={e => { setSearch(e.target.value); setCandidatePage(0); }} />
-            <div className="shared-candidate-list">
-              {candidates.map(item => <label key={item.id}>
-                <input type="checkbox" checked={chosen.has(item.id)} onChange={() => setChosen(prev => {
-                  const next = new Set(prev); next.has(item.id) ? next.delete(item.id) : next.add(item.id); return next;
-                })} />
-                <ProtectedThumbnail url={`/api/shared-albums/owner-media/${item.id}/thumbnail?owner_id=${ownerId}`} label={item.original_filename} />
-                <span title={item.original_filename}>{item.original_filename}</span>
-                {item.media_type === "video" && <small>Video</small>}
-              </label>)}
-              {!candidates.length && <p>No matching media found.</p>}
-            </div>
-            <div className="shared-admin-actions">
-              <button type="button" className="secondary-button" disabled={candidatePage === 0} onClick={() => setCandidatePage(p => p - 1)}>Previous</button>
-              <span>Page {candidatePage + 1}</span>
-              <button type="button" className="secondary-button" disabled={!candidateMore} onClick={() => setCandidatePage(p => p + 1)}>Next</button>
-            </div>
-            <button className="primary-button" disabled={isWorking || !chosen.size} onClick={addMedia}>Share selected ({chosen.size})</button>
-          </>}
-        </section>
+      {selected.length > 0 && <div className="library-toolbar selection-bar">
+        <strong>{ownSelected.length} of your items selected</strong>
+        <button type="button" className="secondary-button" disabled={busy || !ownSelected.length}
+          onClick={removeSelected}>Remove selected from album</button>
+        <button type="button" className="secondary-button" disabled={busy} onClick={() => setSelected([])}>Clear</button>
       </div>}
-
-      <h4>Shared media</h4>
-      <div className="shared-media-grid">
-        {detail.items.map(item => <article className="shared-media-tile" key={item.id}>
-          <button className="shared-media-preview" onClick={() => viewMedia(item)} aria-label={`Open ${item.original_filename}`}>
-            <ProtectedThumbnail url={`/api/shared-albums/${albumId}/media/${item.id}/thumbnail`} label={item.original_filename} />
+      <div className="photo-grid shared-photo-grid">
+        {items.map(item => <article className={`photo-card ${selected.includes(item.id) ? "selected" : ""}`} key={item.id}>
+          <button type="button" className="photo-preview" onClick={() => openViewer(item)}
+            aria-label={`Open ${item.original_filename} full screen`}>
+            <AuthorizedImage url={`/api/shared-albums/${albumId}/media/${item.id}/thumbnail`}
+              alt={item.original_filename} />
             {item.media_type === "video" && <span className="shared-video-badge">▶ Video</span>}
-            {!!item.has_live_motion && <span className="shared-video-badge">Live Photo</span>}
+            {!!item.has_live_motion && <span className="shared-video-badge">Live</span>}
           </button>
-          <div className="shared-media-info"><strong title={item.original_filename}>{item.original_filename}</strong>
-            <small>Owned by {item.owner_username}</small></div>
-          <div className="shared-media-actions">
-            <button className="secondary-button" onClick={() => downloadMedia(item)}>Download</button>
-            {!!item.has_live_motion && <button className="secondary-button" onClick={() => downloadMedia(item, true)}>Motion MOV</button>}
-            {isAdmin && <button className="secondary-button" onClick={() => removeMedia(item.id)}>Unshare</button>}
-          </div>
+          {Number(item.user_id) === Number(me?.id) && <input type="checkbox" className="photo-checkbox"
+            aria-label={`Select ${item.original_filename} to remove from shared album`}
+            checked={selected.includes(item.id)} onChange={() => toggleSelected(item.id)} />}
+          <div className="photo-name" title={item.original_filename}>{item.original_filename}</div>
+          <small className="shared-owner">Shared by {item.owner_username}</small>
         </article>)}
-        {!detail.items.length && <p>No media has been added to this album.</p>}
+        {!items.length && <p>No photos or videos have been shared yet.</p>}
       </div>
-      {detail.has_more && <button className="secondary-button" onClick={() => perform(() => refreshDetail(albumId, itemsOffset + 100, true))}>Load more media</button>}
-    </>}
+      {detail.has_more && <button type="button" className="secondary-button"
+        onClick={async () => { setError(""); try { await refresh(offset + PAGE_SIZE, true); } catch (e) { setError(e.message); } }}>
+        Load more
+      </button>}
+    </> : null}
 
-    {viewer && <div className="shared-viewer-backdrop" role="presentation" onClick={() => { setViewer(null); setVideoUrl(""); }}>
-      <div className="shared-viewer" role="dialog" aria-modal="true" aria-label={viewer.original_filename}
-        onClick={e => e.stopPropagation()}>
-        <button className="secondary-button" onClick={() => { setViewer(null); setVideoUrl(""); }}>Close</button>
-        <h3>{viewer.original_filename}</h3>
-        {viewer.media_type === "video"
-          ? videoUrl ? <video key={viewer.id} src={videoUrl} controls playsInline preload="metadata" /> : <p>Preparing video…</p>
-          : <ProtectedThumbnail url={`/api/shared-albums/${albumId}/media/${viewer.id}/thumbnail`} label={viewer.original_filename} />}
-        <button className="primary-button" onClick={() => downloadMedia(viewer)}>Download original</button>
-        {!!viewer.has_live_motion && <button className="secondary-button" onClick={() => downloadMedia(viewer, true)}>Download motion MOV</button>}
-      </div>
+    {viewer && <div className="photo-viewer shared-fullscreen-viewer" role="dialog" aria-modal="true"
+      aria-label={viewer.original_filename}>
+      <ViewerNavigation items={items} currentId={viewer.id} onNavigate={openViewer}
+        onAfterLast={detail?.has_more ? nextSharedPage : null}/>
+      <button type="button" className="shared-viewer-dismiss" onClick={closeSharedViewer}
+        aria-label="Close full-screen viewer">Close ×</button>
+      <header>
+        <span>{viewer.original_filename}</span>
+        <button type="button" className="secondary-button" onClick={() => downloadMedia(viewer)}>Download</button>
+        {!!viewer.has_live_motion && viewer.media_type !== "video" &&
+          <button type="button" className="secondary-button"
+            onClick={() => motionUrl || motionLoading ? clearMotionPlayback() : playLiveMotion(viewer)}>
+            {motionUrl || motionLoading ? "Show photo only" : "▶ Play Live Photo"}
+          </button>}
+
+        <button type="button" className="secondary-button" onClick={closeSharedViewer}>Close ×</button>
+      </header>
+      {viewer.media_type === "video"
+        ? videoUrl
+          ? <video ref={sharedVideoRef} key={viewer.id} src={videoUrl} controls playsInline preload="metadata" />
+          : <p>Preparing video…</p>
+        : <div className="ll-shared-live-stage">
+            <div className="ll-shared-live-still">
+              <AuthorizedImage eager url={`/api/shared-albums/${albumId}/media/${viewer.id}/preview`}
+                alt={viewer.original_filename} />
+            </div>
+            {!!viewer.has_live_motion && motionUrl && <video ref={sharedVideoRef}
+              key={`${viewer.id}-${motionUrl}`} src={motionUrl}
+              className={motionReady ? "ll-shared-live-motion ll-live-ready" : "ll-shared-live-motion"}
+              autoPlay muted loop playsInline preload="auto"
+              onCanPlay={() => setMotionReady(true)}
+              onError={() => { setMotionReady(false); setMotionPlaybackError(
+                "This motion video's codec cannot play in this browser. You can still download the MOV."); }} />}
+          </div>}
+      {motionPlaybackError && <p className="error-message" role="alert">{motionPlaybackError}</p>}
     </div>}
   </section>;
 }

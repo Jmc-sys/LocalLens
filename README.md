@@ -51,18 +51,18 @@ Own your photos. Own your storage. Own your cloud.
 - [x] Apple HEIC support
 - [x] Session management
 - [x] Security hardening
-- [ ] Automated trash retention
-- [ ] Permanent photo deletion
-- [ ] Dedicated storage management
+- [x] Automated trash retention
+- [x] Permanent photo deletion
+- [x] Dedicated storage management
 - [ ] HTTPS and secure remote access
-- [ ] Video playback
-- [ ] RAW photo support
-- [ ] Apple Live Photos
+- [x] Video playback
+- [x] RAW photo support
+- [x] Apple Live Photos
 - [ ] iOS and Android applications
 - [ ] Automatic mobile backups
-- [ ] Local facial recognition
-- [ ] Local object recognition
-- [ ] AI-powered photo search
+- [x] Local facial recognition
+- [x] Local object recognition
+- [x] AI-powered photo search
 - [ ] Production release
 
 ## Installation

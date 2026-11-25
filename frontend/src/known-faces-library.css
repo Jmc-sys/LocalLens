@@ -1,0 +1,11 @@
+.ll-known-faces { margin-top: 1.2rem; border-top: 1px solid var(--border-color, rgba(128,128,128,.25)); padding-top: 1.1rem; }
+.ll-known-faces-header, .ll-known-faces-toolbar { display: flex; align-items: center; justify-content: space-between; gap: .85rem; flex-wrap: wrap; }
+.ll-known-faces-header > div { display: grid; gap: .3rem; }
+.ll-known-faces-header small, .ll-known-faces-toolbar small, .ll-known-face small { color: var(--muted, #89929b); }
+.ll-known-faces-body { padding-top: 1rem; }
+.ll-known-faces-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(128px,1fr)); gap: .85rem; margin-top: .75rem; }
+.ll-known-face { min-width: 0; display: grid; gap: .45rem; border: 1px solid var(--border-color,rgba(128,128,128,.22)); border-radius: 12px; padding: .55rem; text-align: center; }
+.ll-known-face-name { font-weight: 650; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.ll-known-face-portrait, .ll-known-face-empty { display: block; width: 100%; height: 140px; border-radius: 8px; object-fit: cover; background: rgba(128,128,128,.10); }
+.ll-known-face-empty { display: grid; place-items: center; font-size: .8rem; color: var(--muted,#89929b); }
+.ll-known-faces-hint { margin: 1rem 0; }

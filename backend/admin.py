@@ -1,3 +1,5 @@
+from database_schema import read_schema
+from family_group import annotate_family_members, set_family_membership
 import os
 import shutil
 
@@ -31,6 +33,10 @@ class PasswordReset(BaseModel):
         min_length=12,
         max_length=128
     )
+
+
+class FamilyMembershipChange(BaseModel):
+    enabled: bool
 
 
 def build_admin_router(
@@ -68,7 +74,7 @@ def build_admin_router(
                 """
             )
 
-            return cursor.fetchall()
+            return annotate_family_members(get_connection, cursor.fetchall())
 
     @router.patch("/users/{user_id}")
     def update_user(
@@ -276,5 +282,15 @@ def build_admin_router(
                 "media_bytes": int(photos["media_bytes"]),
                 "total_albums": albums["total_albums"]
             }
+
+    @router.put("/users/{user_id}/family")
+    def update_family_status(user_id: int, data: FamilyMembershipChange,
+                             admin=Depends(require_admin)):
+        return set_family_membership(get_connection, admin['id'], user_id, data.enabled)
+
+    @router.get("/database/schema")
+    def database_structure():
+        """Read-only live schema; protected by the parent admin router."""
+        return read_schema(get_connection)
 
     return router

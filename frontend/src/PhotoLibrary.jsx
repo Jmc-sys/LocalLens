@@ -1,6 +1,13 @@
-import SharedAlbums from "./SharedAlbums";
-import { useCallback, useEffect, useState } from "react";
+import { downloadOwnerOriginal } from "./downloadOriginals";
+import PhotoPageNavigator from "./PhotoPageNavigator";
+import ViewerNavigation from "./ViewerNavigation";
+import SharedAlbums, { AuthorizedImage } from "./SharedAlbums";
+import AiOperations from "./AiOperations";
+import AiActivityTracker from "./AiActivityTracker";
+import AiPhotoAnnotations from "./AiPhotoAnnotations";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, mediaBlob } from "./api";
+import PopularPhotoTags from "./PopularPhotoTags";
 import PrivateImage from "./PrivateImage";
 import UniversalUpload from "./UniversalUpload";
 import PrivateVideo from "./PrivateVideo";
@@ -10,20 +17,24 @@ const isStandaloneVideo = (item) => item?.media_type === "video" ||
 import TrashControls from "./TrashControls";
 import { LiveViewer } from "./LivePhotos";
 
-function OwnerPhotoLibrary({ page }) {
+function OwnerPhotoLibrary({ page, onOpenSharedAlbum }) {
   const [result, setResult] = useState(null);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [albums, setAlbums] = useState([]);
   const [activeAlbum, setActiveAlbum] = useState(null);
   const [selected, setSelected] = useState([]);
   const [viewer, setViewer] = useState(null);
+  const [viewerJump, setViewerJump] = useState(null);
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState("newest");
   const [error, setError] = useState("");
   const [albumName, setAlbumName] = useState("");
   const [targetAlbum, setTargetAlbum] = useState("");
+  const [sharedTargetAlbums, setSharedTargetAlbums] = useState([]);
+  const albumCache = useRef(null);
   const PAGE_SIZE = 100;
   const [pageIndex, setPageIndex] = useState(0);
+  const [libraryTotal, setLibraryTotal] = useState(null);
 
   const isTrash = page === "Trash";
   const albumOverview =
@@ -41,16 +52,49 @@ function OwnerPhotoLibrary({ page }) {
     limit: String(PAGE_SIZE),
     offset: String(pageIndex * PAGE_SIZE),
   });
-  const photoPath = albumOverview
+  const defaultPhotoPath = albumOverview
     ? null
     : albumId !== null
       ? `/albums/${albumId}/photos`
       : `/photos?${params}`;
+  // Reuse the EXISTING toolbar search for all media and owner albums.
+  // The backend searches names/tags as well as filenames with account isolation.
+  const smartSearchActive = search.trim().length > 0 && !albumOverview;
+  const smartParams = new URLSearchParams({
+    sort: page === "Recently Added" ? "newest" : sort,
+    search: search.trim(),
+    media: page === "Videos" ? "video" : page === "Photos" ? "photo" : "all",
+    favorite: String(page === "Favorites"),
+    trash: String(isTrash),
+    limit: String(PAGE_SIZE),
+    offset: String(pageIndex * PAGE_SIZE),
+  });
+  if (activeAlbum?.id != null) smartParams.set("album_id", String(activeAlbum.id));
+  const photoPath = smartSearchActive ? `/ai/unified-search?${smartParams}` : defaultPhotoPath;
   const requestKey = JSON.stringify([page, photoPath, refreshVersion]);
   const currentResult = result?.key === requestKey ? result : null;
   const loadingPhotos = currentResult === null;
   const photos = currentResult?.photos ?? [];
   const loadError = currentResult?.error ?? "";
+
+  // Fetch the real database total separately from the current 100-item page.
+  useEffect(() => {
+    if (!["Photos", "Videos", "Favorites", "Trash"].includes(page) || activeAlbum) {
+      setLibraryTotal(null);
+      return;
+    }
+    const controller = new AbortController();
+    const query = new URLSearchParams({
+      media: page === "Videos" ? "video" : page === "Photos" ? "photo" : "all",
+      search,
+      favorite: String(page === "Favorites"),
+      trash: String(page === "Trash"),
+    });
+    api(`${search.trim() ? "/ai/unified-search/count" : "/media/library-count"}?${query}`, { signal: controller.signal })
+      .then(response => { if (!controller.signal.aborted) setLibraryTotal(Number(response.total)); })
+      .catch(() => { if (!controller.signal.aborted) setLibraryTotal(null); });
+    return () => controller.abort();
+  }, [page, search, activeAlbum?.id, refreshVersion]);
 
   // Mutations and uploads request a refresh of the CURRENT view,
   // even if the user navigated while the operation was running.
@@ -84,9 +128,12 @@ function OwnerPhotoLibrary({ page }) {
       try {
         const [photoData, albumData] = await Promise.all([
           photoPath ? api(photoPath, { signal }) : Promise.resolve([]),
-          api("/albums", { signal }),
+          albumCache.current?.version === refreshVersion
+            ? Promise.resolve(albumCache.current.data)
+            : api("/albums", { signal }),
         ]);
         if (signal.aborted) return;
+        albumCache.current = { version: refreshVersion, data: albumData };
         setAlbums(albumData);
         const liveIds = new Set();
         const missingMotionIds = new Set();
@@ -104,7 +151,7 @@ function OwnerPhotoLibrary({ page }) {
     }
 
     // Debounce only searches in the main photo library.
-    const timer = setTimeout(fetchView, photoPath?.startsWith("/photos?") ? 200 : 0);
+    const timer = setTimeout(fetchView, (photoPath?.startsWith("/photos?") || photoPath?.startsWith("/ai/unified-search?")) ? 300 : 0);
     return () => {
       clearTimeout(timer);
       controller.abort();
@@ -170,19 +217,56 @@ function OwnerPhotoLibrary({ page }) {
     });
   }
 
+  // Load shared/family destinations independently of gallery search and sorting.
+  useEffect(() => {
+    if (page === "Trash") return;
+    let cancelled = false;
+    api("/shared-albums")
+      .then(list => { if (!cancelled) setSharedTargetAlbums(list); })
+      .catch(() => { if (!cancelled) setSharedTargetAlbums([]); });
+    return () => { cancelled = true; };
+  }, [page]);
+
   function addToAlbum() {
     if (!targetAlbum || !selected.length) return;
 
     action(async () => {
-      await api(`/albums/${targetAlbum}/photos`, {
-        method: "POST",
-        body: JSON.stringify({
-          photo_ids: selected,
-        }),
-      });
+      if (String(targetAlbum).startsWith("shared:")) {
+        const id = Number(String(targetAlbum).slice(7));
+        if (!Number.isSafeInteger(id) || id <= 0) throw new Error("Invalid shared album");
+        for (let n = 0; n < selected.length; n += 100) {
+          await api(`/shared-albums/${id}/items`, {
+            method: "POST", body: JSON.stringify({ ids: selected.slice(n, n + 100) }),
+          });
+        }
+      } else {
+        await api(`/albums/${targetAlbum}/photos`, {
+          method: "POST", body: JSON.stringify({ photo_ids: selected }),
+        });
+      }
 
       setSelected([]);
     });
+  }
+
+  async function downloadSelectedOriginals() {
+    if (!selected.length || selected.length > 100) {
+      setError("Select between 1 and 100 media items to download together.");
+      return;
+    }
+    try {
+      setError("");
+      const result = await api("/media/bulk-prepare", {
+        method: "POST",
+        body: JSON.stringify({ photo_ids: selected }),
+      });
+      if (!result?.url || !result.url.startsWith("/api/media/bulk-download/")) {
+        throw new Error("Could not prepare the bulk download.");
+      }
+      // A native HTTP attachment download: no giant JS Blob or local ZIP assembly.
+      // Navigation remains reliable on mobile Safari after an async prepare call.
+      window.location.assign(result.url);
+    } catch (err) { setError(err.message || "Bulk download failed."); }
   }
 
   function moveSelected() {
@@ -209,29 +293,8 @@ function OwnerPhotoLibrary({ page }) {
   }
 
   async function download(photo) {
-    try {
-      if (isStandaloneVideo(photo)) {
-        const { url } = await api(`/videos/${photo.id}/playback-url`, { method: "POST" });
-        const link = document.createElement("a");
-        link.href = `${url}&download=1`;
-        link.download = photo.original_filename;
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        return;
-      }
-      const blob = await mediaBlob(photo.id, "file");
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-
-      link.href = url;
-      link.download = photo.original_filename;
-      link.click();
-
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-    } catch (err) {
-      setError(err.message);
-    }
+    try { await downloadOwnerOriginal(photo); }
+    catch (err) { setError(err.message); }
   }
 
   let visiblePhotos = [...photos];
@@ -264,6 +327,15 @@ function OwnerPhotoLibrary({ page }) {
     });
   }
 
+  // When an arrow crosses a 100-item page, show the first/last item after
+  // the next server page completes. The current viewer stays open meanwhile.
+  useEffect(() => {
+    if (!viewerJump || loadingPhotos || !visiblePhotos.length) return;
+    if (pageIndex !== viewerJump.page) return;
+    setViewer(viewerJump.edge === 'first' ? visiblePhotos[0] : visiblePhotos[visiblePhotos.length - 1]);
+    setViewerJump(null);
+  }, [viewerJump, loadingPhotos, pageIndex, currentResult]);
+
   return (
     <section className="photo-library">
       <div className="library-heading">
@@ -284,6 +356,9 @@ function OwnerPhotoLibrary({ page }) {
       {(page === "Photos" || page === "Videos") && (
         <><UniversalUpload onComplete={load} /></>
       )}
+
+
+      <AiActivityTracker />
 
       {(error || loadError) && (
         <p className="error-message">{error || loadError}</p>
@@ -315,6 +390,26 @@ function OwnerPhotoLibrary({ page }) {
           </div>
         ) : loadError ? null : (
         <div className="album-grid">
+          {/* Family comes first, inside the SAME album grid as personal albums. */}
+          {sharedTargetAlbums.slice().sort((a, b) =>
+            Number(b.name === "Family Album" || b.is_family) -
+            Number(a.name === "Family Album" || a.is_family)
+          ).map((album) => (
+            <article className="album-card" key={`shared-${album.id}`}>
+              <button type="button" className="album-cover shared-family-card"
+                onClick={() => onOpenSharedAlbum(album.id)}
+                aria-label={`Open shared album ${album.name}`}>
+                {album.cover_photo_id
+                  ? <AuthorizedImage
+                      url={`/api/shared-albums/${album.id}/media/${album.cover_photo_id}/thumbnail`}
+                      alt={`Cover for ${album.name}`} />
+                  : <div className="shared-cover-placeholder" aria-hidden="true">▧</div>}
+
+              </button>
+              <h3>{album.name}</h3>
+              <p>{Number(album.item_count || 0).toLocaleString()} items · Shared</p>
+            </article>
+          ))}
           {albums.map((album) => (
             <article className="album-card" key={album.id}>
               <button
@@ -380,9 +475,12 @@ function OwnerPhotoLibrary({ page }) {
         )
       ) : (
         <>
+          {page === "Photos" && <PopularPhotoTags onSearch={(tag) => {
+            setSearch(tag); setPageIndex(0); setSelected([]);
+          }} />}
           <div className="library-toolbar">
             <input
-              placeholder="Search photos..."
+              placeholder="Search filenames, tags, people or pets..."
               value={search}
               onChange={(e) => {
                 setSearch(e.target.value);
@@ -423,6 +521,12 @@ function OwnerPhotoLibrary({ page }) {
           {!loadingPhotos && !loadError && selected.length > 0 && (
             <div className="library-toolbar selection-bar">
               <strong>{selected.length} selected</strong>
+              {!isTrash && (
+                <button type="button" className="secondary-button"
+                  onClick={() => void downloadSelectedOriginals()}>
+                  Download selected
+                </button>
+              )}
 
               {!isTrash && (
                 <>
@@ -437,6 +541,13 @@ function OwnerPhotoLibrary({ page }) {
                         {album.name}
                       </option>
                     ))}
+                  <optgroup label="Family and shared albums">
+                      {sharedTargetAlbums.map(album => (
+                        <option key={`shared-${album.id}`} value={`shared:${album.id}`}>
+                          {album.name} (Shared)
+                        </option>
+                      ))}
+                    </optgroup>
                   </select>
 
                   <button
@@ -486,7 +597,9 @@ function OwnerPhotoLibrary({ page }) {
 
           {!loadingPhotos && !loadError && (
             <p className="media-count">
-              {visiblePhotos.length} items displayed
+              {activeAlbum
+                ? `${visiblePhotos.length.toLocaleString()} items in album`
+                : `Showing ${visiblePhotos.length.toLocaleString()} of ${libraryTotal === null ? "…" : libraryTotal.toLocaleString()} ${page === "Photos" ? "photos" : page === "Videos" ? "videos" : "items"}`}
             </p>
           )}
 
@@ -551,42 +664,42 @@ function OwnerPhotoLibrary({ page }) {
 
                 <div className="photo-name">
                   {isStandaloneVideo(photo) && <span className="media-video-tag">▶ VIDEO</span>}
-                  {photo.is_live && <span className="live-tag">LIVE </span>}{photo.motion_missing && <span className="motion-incomplete-tag" title="Original image preserved; companion motion video was not received">MOTION MISSING </span>}{photo.original_filename}
+                  {photo.is_live && <span className="live-tag">LIVE </span>}{photo.original_filename}
                 </div>
               </article>
             ))}
           </div>
         )}
           {!activeAlbum && (
-            <div className="pagination">
-              <button
-                className="secondary-button"
-                disabled={loadingPhotos || pageIndex === 0}
-                onClick={() =>
-                  { setSelected([]); setPageIndex((index) => Math.max(0, index - 1)); }
-                }
-              >
-                Previous
-              </button>
-
-              <span>Page {pageIndex + 1}</span>
-
-              <button
-                className="secondary-button"
-                disabled={loadingPhotos || !!loadError || photos.length < PAGE_SIZE}
-                onClick={() =>
-                  { setSelected([]); setPageIndex((index) => index + 1); }
-                }
-              >
-                Next
-              </button>
-            </div>
+            <PhotoPageNavigator
+              pageIndex={pageIndex}
+              pageSize={PAGE_SIZE}
+              totalItems={libraryTotal}
+              loading={loadingPhotos}
+              hasError={!!loadError}
+              hasMore={photos.length === PAGE_SIZE}
+              onChangePage={(nextIndex) => {
+                setSelected([]);
+                setPageIndex(nextIndex);
+              }}
+            />
           )}
         </>
       )}
 
       {viewer && (
         <div className="photo-viewer">
+          <ViewerNavigation items={visiblePhotos} currentId={viewer.id} onNavigate={setViewer}
+            onBeforeFirst={!activeAlbum && pageIndex > 0 ? () => {
+              setViewerJump({page: pageIndex - 1, edge:'last'});
+              setPageIndex(pageIndex - 1);
+            } : null}
+            onAfterLast={!activeAlbum && libraryTotal !== null &&
+                (pageIndex + 1) * PAGE_SIZE < libraryTotal ? () => {
+              setViewerJump({page: pageIndex + 1, edge:'first'});
+              setPageIndex(pageIndex + 1);
+            } : null}/>
+
           <header>
             <span>{viewer.original_filename}</span>
 
@@ -594,7 +707,7 @@ function OwnerPhotoLibrary({ page }) {
               className="secondary-button"
               onClick={() => download(viewer)}
             >
-              Download original
+              Download
             </button>
 
             <button
@@ -604,6 +717,7 @@ function OwnerPhotoLibrary({ page }) {
               Close ×
             </button>
           </header>
+          <AiPhotoAnnotations photoId={viewer.id} />
 
           {viewer.is_live ? <LiveViewer key={viewer.id} photo={viewer}>
           {isStandaloneVideo(viewer) ? <PrivateVideo photo={viewer} /> : (<PrivateImage
@@ -644,9 +758,20 @@ function OwnerPhotoLibrary({ page }) {
   );
 }
 
-// Shared Album browsing is isolated from existing owner-only gallery hooks.
+// One Albums overview for personal and admin-managed family albums.
+// Shared detail REPLACES the overview; it is never mounted above personal cards.
 export default function PhotoLibrary(props) {
-  return props.page === "Shared Albums"
-    ? <SharedAlbums />
-    : <OwnerPhotoLibrary {...props} />;
+  const [activeSharedAlbumId, setActiveSharedAlbumId] = useState(null);
+  useEffect(() => {
+    if (props.page !== "Albums") setActiveSharedAlbumId(null);
+  }, [props.page]);
+
+  if (props.page === "Albums" && activeSharedAlbumId !== null) {
+    return <SharedAlbums
+      embedded
+      openedAlbumId={activeSharedAlbumId}
+      onBack={() => setActiveSharedAlbumId(null)}
+    />;
+  }
+  return <OwnerPhotoLibrary {...props} onOpenSharedAlbum={setActiveSharedAlbumId} />;
 }

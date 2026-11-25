@@ -1,3 +1,4 @@
+import FamilyMemberCell from "./FamilyMemberCell";
 
 import { useEffect, useState } from "react";
 import { api } from "./api";
@@ -241,7 +242,7 @@ export default function AdminDashboard() {
                 <th>Storage used</th>
                 <th>Quota</th>
                 <th>Actions</th>
-              </tr>
+              <th scope="col">Family group</th></tr>
             </thead>
 
             <tbody>
@@ -328,7 +329,7 @@ export default function AdminDashboard() {
                       )}
                     </div>
                   </td>
-                </tr>
+                <td><FamilyMemberCell user={user} /></td></tr>
               ))}
             </tbody>
           </table>

@@ -1,0 +1,32 @@
+# Overlay after docker-compose.yml and ai/compose.ai.yml.
+services:
+  ai-scheduler:
+    build:
+      context: .
+      dockerfile: ai/Dockerfile
+    command: ["python", "-u", "/opt/ai/auto.py"]
+    env_file: .env
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      DB_NAME: ${DB_NAME:-locallens}
+      DB_USER: ${DB_USER:-locallens}
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      MEDIA_ROOT: /storage
+      HF_HOME: /models
+      AI_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      AI_PRESSURE_COOLDOWN_SECONDS: "12"
+      AI_UPLOAD_IDLE_SECONDS: "12"
+      AI_BATCH_LIMIT: "20"
+      AI_SCAN_PAUSE_SECONDS: "1.5"
+    volumes_from:
+      - backend:ro
+    volumes:
+      - locallens_ai_models:/models
+    depends_on:
+      - db
+    cpus: "1.0"
+    mem_limit: 4g
+    profiles: [ai]
+    restart: unless-stopped

@@ -7,7 +7,7 @@ import Register from "./Register";
 import SystemStatus from "./SystemStatus";
 import PhotoLibrary from "./PhotoLibrary";
 import AccountSettings from "./AccountSettings";
-import AdminDashboard from "./AdminDashboard";
+import AdminDashboard from "./AdminSchemaWrapped";
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -75,7 +75,7 @@ export default function App() {
 
   const navigation = [
     "Photos", "Videos",
-    "Albums", "Shared Albums",
+    "Albums",
     "Favorites",
 
     "Trash",
@@ -152,7 +152,7 @@ export default function App() {
           )}
 
           <div className="sidebar-version">
-            LocalLens v0.3.0
+            LocalLens v0.6.20
             <br />
             Private by design
           </div>
